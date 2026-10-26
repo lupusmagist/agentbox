@@ -25,7 +25,7 @@ AB=${AGENTBOX_BIN:-$REPO/bin/agentbox}
 WORK="${TMPDIR:-/tmp}/agentbox-acceptance"
 A="$WORK/demoX"; B="$WORK/other"; BASE="$WORK/base"
 export AGENTBOX_HOME_BASE="$BASE"      # never write into the real agent_home/
-export XDG_CONFIG_HOME="$WORK/conf"    # ...nor the real config.toml
+export AGENTBOX_LOCAL="$WORK/local.toml"   # ...nor a real local.toml in the checkout
 # XDG_DATA_HOME is deliberately NOT redirected: podman keeps its storage under it,
 # and a storage tree inside $WORK is full of root-owned files that the user cannot
 # delete afterwards (the suite would leave an undeletable directory behind).
@@ -237,6 +237,36 @@ check "--network online overrides for one run" \
 (cd "$A" && printf 'schema = 1\nnetwork = "none"\nfoo = 1\n' > .agentbox.toml && "$AB" status >/dev/null 2>&1); rc=$?
 check "an unknown project key exits 2" "[ $rc -eq 2 ]"
 printf 'schema = 1\nnetwork = "none"\n' > "$A/.agentbox.toml"
+
+group "state lives in \$APP, not in \$USER_HOME"
+printf 'schema = 1\n[sandbox]\nmemory = "2g"\n' > "$WORK/local.toml"
+check "local.toml supplies the ceiling" \
+  "(cd $A && \"$AB\" status 2>&1 | grep -qE 'memory +2g')"
+mkdir -p "$WORK/tight" && printf 'schema = 1\nnetwork = "none"\nmemory = "8g"\n' > "$WORK/tight/.agentbox.toml"
+(cd "$WORK/tight" && "$AB" status >/dev/null 2>&1); rc=$?
+check "the project may not exceed a local.toml ceiling (exit 2)" "[ $rc -eq 2 ]"
+check "the refusal still names the ceiling" \
+  "(cd $WORK/tight && \"$AB\" status 2>&1 | grep -q 'would loosen the sandbox')"
+printf 'schema = 1\n[sandbox]\nmemory = "2g"\nmemroy = "1g"\n' > "$WORK/local.toml"
+(cd "$A" && "$AB" status >/dev/null 2>&1); rc=$?
+check "an unknown local.toml [sandbox] key exits 2" "[ $rc -eq 2 ]"
+check "the refusal names local.toml" \
+  "(cd $A && \"$AB\" status 2>&1 | grep -q 'local.toml')"
+printf 'schema = 1\n[sandbox]\nmemory = "2g"\n' > "$WORK/local.toml"
+FAKE="$WORK/fakehome"; mkdir -p "$FAKE/.config/agentbox" "$FAKE/.local/share/agentbox"
+check "a missing local.toml is simply absent config" \
+  "(cd $A && AGENTBOX_LOCAL=$WORK/nope.toml \"$AB\" status 2>&1 | grep -qE 'memory +4g')"
+check "settings never come from \$USER_HOME" \
+  "(cd $A && HOME=$FAKE \"$AB\" status 2>&1 | grep -qE 'network +none')"
+printf '[sandbox]\nmemory = "1g"\n' > "$FAKE/.config/agentbox/config.toml"
+check "a leftover \$USER_HOME config exits 2" \
+  "(cd $A && HOME=$FAKE \"$AB\" status >/dev/null 2>&1; [ \$? -eq 2 ])"
+check "the refusal names local.toml and the file to move" \
+  "(cd $A && HOME=$FAKE \"$AB\" status 2>&1 | grep -q 'local.toml' && \
+    cd $A && HOME=$FAKE \"$AB\" status 2>&1 | grep -q '.config/agentbox/config.toml')"
+rm -f "$FAKE/.config/agentbox/config.toml"
+check "the base is \$APP/agent_home when no override is set" \
+  "(cd $A && env -u AGENTBOX_HOME_BASE \"$AB\" home | head -1 | grep -qx '$REPO/agent_home')"
 
 group "leaving the shell releases the box"
 (cd "$A" && "$AB" </dev/null >/dev/null 2>&1)

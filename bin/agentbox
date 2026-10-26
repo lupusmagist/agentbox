@@ -29,13 +29,15 @@ EXIT_OK, EXIT_FAIL, EXIT_CONFIG, EXIT_NOIMAGE = 0, 1, 2, 3
 
 REPO = Path(__file__).resolve().parent.parent
 SKEL = REPO / "dotfiles"           # default dotfiles, baked into the image
-BASE_HOME = REPO / "agent_home"    # your base $HOME, gitignored (DESIGN.md 16)
+BASE_HOME = REPO / "agent_home"    # $BASE_HOME: copied into each box's $BOX_HOME
+LOCAL_CONFIG = REPO / "local.toml"  # this machine's overrides, gitignored
 LOCK = REPO / "tools.lock"
 DEFAULTS_FILE = REPO / "defaults.toml"
 AGENT_MD = REPO / "AGENT.md"
 
-DATA = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "agentbox"
-CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agentbox"
+# Nothing is read from $USER_HOME: configuration and state live in REPO.
+# Old versions kept a config file under ~/.config and a build record under
+# ~/.local/share; see legacy_paths() and `agentbox doctor`.
 
 # inside the box
 BOX_HOME = "/home/agentbox"
@@ -163,15 +165,35 @@ def box_name(root: Path, lab: bool = False) -> str:
 # See DESIGN.md 16.
 
 def base_home() -> Path:
-    """The base $HOME: agent_home/ next to the CLI, or [home] base in config."""
+    """$BASE_HOME. No config lookup: the app directory owns it."""
     env = os.environ.get("AGENTBOX_HOME_BASE")
-    if env:
-        return Path(env).expanduser()
-    conf = load_toml(CONF_DIR / "config.toml")
-    where = (conf.get("home") or {}).get("base")
-    if where:
-        return Path(str(where)).expanduser()
-    return BASE_HOME
+    return Path(env).expanduser() if env else BASE_HOME
+
+
+def local_config() -> Path:
+    """$APP/local.toml: this machine's overrides. AGENTBOX_LOCAL is for tests."""
+    env = os.environ.get("AGENTBOX_LOCAL")
+    return Path(env).expanduser() if env else LOCAL_CONFIG
+
+
+def legacy_paths() -> tuple[Path, ...]:
+    """Where older agentbox versions kept state in $USER_HOME. Never read."""
+    home = Path.home()
+    return (home / ".config" / "agentbox", home / ".local" / "share" / "agentbox")
+
+
+def refuse_legacy_state() -> None:
+    """Hard error on a config file an older version would have honoured.
+
+    Silently ignoring it would drop [sandbox] hardening without saying so.
+    """
+    old = legacy_paths()[0] / "config.toml"
+    if not old.exists():
+        return
+    die(f"{old} is from an older agentbox and is no longer read.\n"
+        f"       move its [defaults] and [sandbox] tables to {local_config()}:\n"
+        f"         mv {old} {local_config()}\n"
+        "       then delete the empty directory", EXIT_CONFIG)
 
 
 def box_home(root: Path) -> Path:
@@ -418,14 +440,15 @@ def to_bytes(value) -> int:
 
 
 def merged_config(root: Path, cli: dict | None = None) -> dict:
-    """CLI > project > user config > defaults.toml > built-in."""
+    """CLI > project > local.toml > defaults.toml > built-in."""
     builtin = {"network": "none", "memory": "4g", "cpus": 4, "pids": 512,
                "mounts": [], "schema": SCHEMA,
                "ulimit_nofile": "8192:8192", "tmpfs_tmp": "256m",
                "tmpfs_run": "64m", "tmpfs_vartmp": "64m"}
 
     defaults = load_toml(DEFAULTS_FILE)
-    user = load_toml(CONF_DIR / "config.toml")
+    local_path = local_config()
+    local = load_toml(local_path)
     proj_path = root / ".agentbox.toml"
     proj = load_toml(proj_path)
 
@@ -437,26 +460,32 @@ def merged_config(root: Path, cli: dict | None = None) -> dict:
             allowed = ", ".join(sorted(PROJECT_KEYS - {"schema"}))
             die(f"{proj_path.name} may not set {names}\n"
                 f"       a project may set only: {allowed}\n"
-                "       anything else is either a preference (put it in your home) or "
-                "hardening\n"
-                f"       (user-level only, in {DEFAULTS_FILE} or {CONF_DIR / 'config.toml'})",
+                "       anything else is either a preference (put it in your base home) "
+                "or hardening\n"
+                f"       (machine-level only, in {DEFAULTS_FILE} or {local_path})",
                 EXIT_CONFIG)
         if proj.get("schema", SCHEMA) != SCHEMA:
             die(f"{proj_path.name}: unsupported schema {proj.get('schema')} "
                 f"(this agentbox speaks {SCHEMA})", EXIT_CONFIG)
 
     cfg = dict(builtin)
-    for layer in (defaults.get("defaults", {}), user.get("defaults", {}), proj):
+    for layer in (defaults.get("defaults", {}), local.get("defaults", {}), proj):
         for key, val in layer.items():
             if key in cfg or key == "provider_keys":
                 cfg[key] = val
-    for key, val in (defaults.get("sandbox") or {}).items():
-        if key not in SANDBOX_KEYS:
-            die(f"{DEFAULTS_FILE}: unknown [sandbox] key {key!r}", EXIT_CONFIG)
-        cfg[key] = val
+    # The machine profile is defaults.toml with local.toml overlaid; remember which
+    # file supplied each ceiling so the refusal can name it.
+    ceiling_from: dict[str, Path] = {}
+    for path, src in ((DEFAULTS_FILE, defaults), (local_path, local)):
+        for key, val in (src.get("sandbox") or {}).items():
+            if key not in SANDBOX_KEYS:
+                die(f"{path}: unknown [sandbox] key {key!r}", EXIT_CONFIG)
+            cfg[key] = val
+            ceiling_from[key] = path
     # A project may TIGHTEN a limit but never loosen one: the machine profile in
     # [sandbox] is the ceiling. Silently ignoring the project value (which is what
-    # a plain merge did) made .agentbox.toml's memory/cpus/pids a lie.
+    # a plain merge did) made .agentbox.toml's memory/cpus/pids a lie. local.toml
+    # is applied above, before this check, so it is a real ceiling too.
     for key in ("memory", "cpus", "pids"):
         if key not in proj:
             continue
@@ -467,14 +496,12 @@ def merged_config(root: Path, cli: dict | None = None) -> dict:
         except (TypeError, ValueError):
             die(f"{proj_path.name}: {key} = {want!r} is not a valid limit", EXIT_CONFIG)
         if looser:
+            src = ceiling_from.get(key, DEFAULTS_FILE)
             die(f"{proj_path.name}: {key} = {want} would loosen the sandbox "
-                f"(ceiling {ceiling} from {DEFAULTS_FILE})\n"
-                f"       raise it in {DEFAULTS_FILE} [sandbox] if every project should "
+                f"(ceiling {ceiling} from {src})\n"
+                f"       raise it in {src} [sandbox] if every project should "
                 "get more", EXIT_CONFIG)
         cfg[key] = want
-    for key, val in (user.get("sandbox") or {}).items():
-        if key in SANDBOX_KEYS:
-            cfg[key] = val
     for key, val in CLI_OVERRIDE.items():
         if val is not None:
             cfg[key] = val
@@ -578,10 +605,6 @@ def do_build() -> None:
     if res.returncode != 0:
         die("build failed", EXIT_FAIL)
     iid = image_id()
-    DATA.mkdir(parents=True, exist_ok=True)
-    (DATA / "image.json").write_text(json.dumps(
-        {"tag": tag, "id": iid, "lock": lock_hash(),
-         "built": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=2))
     note(f"built {tag}")
     print(f"  id: {iid}")
 
@@ -1122,12 +1145,6 @@ def cmd_doctor(args) -> int:
     img = image_id()
     check(1, "image present and matches tools.lock", bool(img),
           f"id {img[:19]}" if img else "run 'agentbox build'")
-    if img:
-        rec = DATA / "image.json"
-        if rec.exists():
-            data = json.loads(rec.read_text())
-            check(1, "image label matches lock hash", data.get("lock") == lock_hash(),
-                  f"lock {lock_hash()} vs image {data.get('lock')}")
 
     # 2/3 the box homes hold keys, so none of them may be tracked by git
     boxes = podman_json("ps", "-a", "--filter", f"label={LABEL}", "--format", "json") or []
@@ -1397,6 +1414,9 @@ examples
     sp.add_argument("--apply", dest="dry_run", action="store_false", help="remove them")
 
     args = p.parse_args(argv)
+    # --version/--help exit inside parse_args, so a leftover config file never
+    # prevents diagnosing the install.
+    refuse_legacy_state()
     if args.network:
         CLI_OVERRIDE["network"] = args.network
     if not getattr(args, "func", None):
