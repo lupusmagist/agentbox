@@ -153,15 +153,16 @@ def box_name(root: Path, lab: bool = False) -> str:
 
 # --------------------------------------------------------------- the box $HOME
 #
-# $HOME inside a box is a real, writable directory, seeded once per project by
-# copying the base and then left alone:
+# $AGENT_HOME (/home/agentbox) is a real, writable directory in every box: it is
+# the project's $BOX_HOME bind-mounted there, seeded once by copying $BASE_HOME
+# and then left alone.
 #
-#   agent_home/                  your base $HOME, next to this CLI, gitignored
-#   <project>/.agentbox/home/    the copy a box runs on (keys live here)
-#   <project>/.agentbox/home/.cache/   disposable, never pushed to the base
+#   $BASE_HOME  = <app>/agent_home/            gitignored; copied, never mounted
+#   $BOX_HOME   = <project>/.agentbox/home/    what the box runs on (keys here)
+#   $BOX_HOME/.cache/                          disposable, never pushed
 #
-# `agentbox home push` copies changes back into the base. New boxes inherit the
-# base; boxes that already exist keep their own copy until `agentbox home sync`.
+# `agentbox home push` copies changes back into $BASE_HOME. New boxes inherit it;
+# boxes that already exist keep their own copy until `agentbox home sync`.
 # See DESIGN.md 16.
 
 def base_home() -> Path:
@@ -1377,25 +1378,27 @@ def main(argv: list[str]) -> int:
              "then run 'agentbox build'.")
     sp.add_argument("-y", "--yes", action="store_true", help="assume yes")
     sp = box(
-        "home", "your base $HOME: push changes back, sync into a box",
-        f"""A box's $HOME is a copy of your base, taken when the box is created.
-The copy is what this box writes to; the base is what new boxes start from.
+        "home", "$BASE_HOME: push changes back, sync into a box",
+        f"""The box's $AGENT_HOME is a copy of $BASE_HOME, taken when the box is
+created. The copy lives at $BOX_HOME on the host and is what the box writes to;
+$BASE_HOME is what NEW boxes start from.
 
-base: {BASE_HOME}
+$BASE_HOME: {BASE_HOME}
+$BOX_HOME:  <project>/.agentbox/home  (this project's copy)
 
 ACTION (default: path)
-  path    print the base directory. Changes nothing.
+  path    print $BASE_HOME. Changes nothing.
   open    print it, then open it in your file manager.
-  push    copy what you changed in THIS box back into the base.
-  sync    copy what changed in the base into THIS box.
-  reset   delete this box's $HOME (and its container) to start over.
+  push    copy what you changed in THIS box back into $BASE_HOME.
+  sync    copy what changed in $BASE_HOME into THIS box.
+  reset   delete this box's $BOX_HOME (and its container) to start over.
 
 `push` reaches new boxes only. A box that already exists keeps the copy it was
 given until you run `agentbox home sync` inside it; sync keeps any file the box
 changed itself, unless you pass --force.
 
 PATH (push only)
-  Zero or more files or directories relative to $HOME, e.g.
+  Zero or more files or directories relative to $AGENT_HOME, e.g.
   `agentbox home push .config/nvim`. With none, push sends the shell config,
   .gitconfig, .config, bin and .local/bin.
 
@@ -1404,12 +1407,12 @@ PATH (push only)
   key-shaped file names, and file contents that look like a credential.
 
 examples
-  agentbox home                      where the base lives
-  agentbox home push                 promote this box's setup to the base
+  agentbox home                      where $BASE_HOME lives
+  agentbox home push                 promote this box's setup to $BASE_HOME
   agentbox home push .config/nvim    promote one directory
   agentbox home push --dry-run       list what would change, copy nothing
-  agentbox home sync --force         take the base, discarding local edits
-  agentbox home reset --yes          fresh $HOME on the next start""")
+  agentbox home sync --force         take $BASE_HOME, discarding local edits
+  agentbox home reset --yes          fresh $AGENT_HOME on the next start""")
     sp.add_argument("action", nargs="?", default="path", metavar="ACTION",
                     choices=("path", "open", "push", "sync", "reset"),
                     help="what to do (default: path)")
