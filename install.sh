@@ -85,11 +85,11 @@ if command -v getenforce >/dev/null 2>&1; then
     esac
 fi
 
-# --- git (for 'agentbox push' and the recipe itself) ----------------------
+# --- git (for 'agentbox home push' and the checkout itself) ----------------
 if command -v git >/dev/null 2>&1; then
     ok "git $(git --version | awk '{print $3}')"
 else
-    warn "git not found; 'agentbox push' will not work"
+    warn "git not found; 'agentbox home push' will not work"
 fi
 
 # --- optional -------------------------------------------------------------
@@ -123,11 +123,15 @@ Next:
   cd ~/projects/<a repo>
   agentbox                # create the box and enter it
 
-Optional, and recommended: keep your own dotfiles, git identity and agent notes
-outside this repo (they are never overwritten by a git pull):
+Optional: build your \$BASE_HOME, the home every new box starts from. Do it
+inside a box, so nothing in your own \$USER_HOME is involved:
 
-  mkdir -p ~/.config/agentbox/recipe/dotfiles
-  cp ~/.zshrc ~/.config/agentbox/recipe/dotfiles/zshrc
-  \$EDITOR ~/.config/agentbox/recipe/dotfiles/gitconfig
-  \$EDITOR ~/.config/agentbox/recipe/AGENT.extra.md
+  cd <a project> && agentbox     # create a box and enter it
+  ...install your tools, edit ~/.bashrc, npmg <agent>...
+  exit
+  agentbox home push             # promote that to \$BASE_HOME for NEW boxes
+
+\$BASE_HOME lives at this checkout's agent_home/ and is gitignored, so a
+git pull never overwrites it. Existing boxes keep their own copy; inside one,
+'agentbox home sync' brings them up to date.
 EOF

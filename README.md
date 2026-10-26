@@ -28,6 +28,23 @@ Requirements: Linux with **rootless** Podman (`crun`), Python 3.11+, subordinate
 cgroups v2, and `git`. Developed on Fedora 44 with SELinux enforcing, where it is tested;
 `install.sh` checks each prerequisite before it links anything.
 
+## The four names
+
+These are the only paths this project talks about, and confusing them is the source of most of its
+edge cases.
+
+| Name | Where it is | What it is |
+|---|---|---|
+| `$APP` | the checkout, e.g. `~/projects/agentbox` | the application: `bin/agentbox`, `defaults.toml`, `local.toml`, `tools.lock`, `Containerfile`, `agent_home/`. Everything the tool needs is here and nowhere else |
+| `$USER_HOME` | your shell's `~` | **never read.** The tool and the base take nothing from it; the only write is the `install.sh` PATH link, which `--no-link` skips |
+| `$BASE_HOME` | `$APP/agent_home/` | gitignored payload. Copied into a box's home when it is created; never mounted |
+| `$BOX_HOME` | `<project>/.agentbox/home/` | the per-project copy the box runs on: writes, keys, cache, history. Gitignored inside the project, and refused if git tracks it |
+| `$AGENT_HOME` | `/home/agentbox` inside the box | the container's view of `$BOX_HOME` |
+
+So: `$BASE_HOME` seeds `$BOX_HOME` once, `$BOX_HOME` is mounted at `$AGENT_HOME`, and `home
+push`/`sync` copy between `$BOX_HOME` and `$BASE_HOME`. Nothing reads `$USER_HOME`, not even a
+config file — machine-level settings live in `$APP/local.toml`.
+
 ## Installation
 
 ```bash
@@ -49,7 +66,7 @@ deliberately no global npm prefix — configuring one breaks `nvm use` — so a 
 installed with `npmg <tool>` (an alias for `npm i -g --prefix ~/.npm-global`). The package
 list is the `packages` array in `tools.lock` — edit it there, not in the `Containerfile`. There is **no agent
 CLI**, no editor configuration, no shell framework and no version manager — those are your choices,
-and they belong in your base home (below), not in an image everyone shares.
+and they belong in your `$BASE_HOME` (below), not in an image everyone shares.
 
 If `agentbox doctor` is not all green, stop there: it is diagnosing the host and the image, and
 nothing in a box will be more informative.
@@ -113,8 +130,14 @@ pids    = 512
 
 That is the whole file. It exists for the things that genuinely differ per project — network
 access, how much of the machine it may use, and extra mounts. Anything else is either a preference
-(belongs in your base home) or hardening (machine-level, in `defaults.toml`). A key the tool does
+(belongs in your `$BASE_HOME`) or hardening (machine-level, in `$APP/defaults.toml` for every
+machine, or `$APP/local.toml` for this one). A key the tool does
 not honour is a hard error naming what it does accept, never a silent ignore.
+
+The full precedence, lowest to highest: built-in → `defaults.toml` → `local.toml` →
+`.agentbox.toml` → command line. A project may tighten a limit but never raise one above the
+machine profile in `[sandbox]`; `local.toml` is that profile's per-machine overlay and is
+gitignored, so a `git pull` cannot conflict with it.
 
 **Network is on by default.** Most projects fetch something in their first minute. Set
 `network = "none"` for a project that should not reach out, or pass `--network none` for a single
@@ -126,18 +149,19 @@ run. Be clear about the trade: `none` is the only mode that stops an outbound co
 networking is user-mode only — no tap devices, no bridges — so reach a guest through a port forward.
 LXC, containerlab and podman-in-podman cannot work here: they need capabilities every box drops.
 
-## The base home and the box home
+## `$BASE_HOME` and `$BOX_HOME`
 
-Every box has a real `$HOME` at `/home/agentbox`. It is not a shared volume and not a bind mount of
-your host `~`; it is a **copy of a base directory you own**, made when the box is created:
+Every box has a real `$AGENT_HOME` at `/home/agentbox`. It is not a shared volume and not a bind
+mount of your `$USER_HOME`; it is a **copy of `$BASE_HOME`**, made when the box is created:
 
 ```
-~/projects/agentbox/agent_home/      the base: yours, gitignored
-<project>/.agentbox/home/            one box's copy: writable, gitignored
+$APP/agent_home/                      $BASE_HOME: yours, gitignored, the seed
+<project>/.agentbox/home/             $BOX_HOME: one box's copy, writable, gitignored
 ```
 
-The base is what new boxes start from. The copy is what a box writes to. Nothing is shared between
-boxes, so a config change or an installed tool in one project cannot surprise another.
+`$BASE_HOME` is what new boxes start from. `$BOX_HOME` is what a box writes to, and it is the only
+host directory a box ever sees (plus the project itself). Nothing is shared between boxes, so a
+config change or an installed tool in one project cannot surprise another.
 
 ### Build your base, once
 
@@ -209,7 +233,7 @@ gitignored here, so nothing else will back it up.
 | `stop [box]` | stop it, keep it for reuse |
 | `rm [box] [--home]` | remove the container, optionally with this project's home |
 | `logs [box] [-f] [--lab]` | the box's stdout, including seeding failures |
-| `home ACTION [PATH…]` | the base home workflow above |
+| `home ACTION [PATH…]` | the `$BASE_HOME` workflow above |
 | `build` | build the image from `tools.lock` |
 | `update` | report whether the pinned base is current; changes nothing |
 | `doctor` | twelve checks for drift and leaks; exit 1 on failure |
@@ -222,15 +246,16 @@ failure, `2` config error, `3` image missing.
 
 | What | Path |
 |---|---|
-| The recipe: image, package list, `AGENT.md`, CLI | the checkout, e.g. `~/projects/agentbox/` |
-| Built image | `localhost/agentbox/base:current` (+ a dated tag) |
-| Your base `$HOME` | `~/projects/agentbox/agent_home/` (gitignored) |
-| A box's `$HOME`, keys, cache, history | `<project>/.agentbox/home/` |
+| `$APP`: CLI, image recipe, `AGENT.md`, `defaults.toml`, `local.toml` | the checkout, e.g. `~/projects/agentbox/` |
+| Built image | `localhost/agentbox/base:current` (+ a dated tag carrying the lock hash) |
+| `$BASE_HOME` | `<checkout>/agent_home/` (gitignored) |
+| `$BOX_HOME` (becomes `$AGENT_HOME`), keys, cache, history | `<project>/.agentbox/home/` |
+| Per-machine settings | `<checkout>/local.toml` (gitignored) |
 | Project settings | `<project>/.agentbox.toml` |
 
-The built image is rebuildable, the container holds nothing, and the box home is a copy. The only
-things that would hurt to lose are your base and your project — which is why the base deserves its
-own repository.
+Nothing is written to `$USER_HOME`. The built image is rebuildable, the container holds nothing,
+and the box home is a copy. The only things that would hurt to lose are `$BASE_HOME` and your
+project — which is why `$BASE_HOME` deserves its own repository.
 
 ## Troubleshooting
 
@@ -243,6 +268,12 @@ files, no host `~/.ssh` reachable from a box, no key-shaped file tracked in a pr
 
 **`crun: getcwd: Operation not permitted`.** The project directory was deleted or recreated under a
 live container and lost its SELinux label. `agentbox` detects that and recreates the box.
+
+**I had settings in `~/.config/agentbox/config.toml`.** That file is not read any more: `agentbox`
+exits 2 and tells you to move its `[defaults]` and `[sandbox]` tables into `$APP/local.toml`. Only
+the leftover is reported — nothing under `$USER_HOME` is read at runtime, and `doctor` lists any
+remaining old directory as a warning — it is not read, but check what is in it before you delete it
+(older versions kept user dotfiles under `~/.config/agentbox/`).
 
 **A tool I installed in one project isn't in another.** Correct: a box home is a copy. `agentbox
 home push` puts it in the base for new boxes, `agentbox home sync` brings an existing one up to
@@ -257,7 +288,7 @@ belongs to that box. Push it, then sync.
 
 ```bash
 ./bin/agentbox --version          # version + a hash of the exact source
-bash tests/acceptance.sh          # 103 end-to-end checks against real containers, cleans up
+bash tests/acceptance.sh          # end-to-end checks against real containers, cleans up
 KEEP=1 bash tests/acceptance.sh   # leave the test boxes behind to inspect
 ```
 

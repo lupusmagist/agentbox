@@ -20,21 +20,24 @@ project's notes: nothing from another project is mounted here.
 
 | Path | |
 |---|---|
-| `~` — `/home/agentbox` | **yours.** `.config`, `.local`, `bin`, `.cache`, `.history`, `.ssh`, everything |
+| `$AGENT_HOME` — your `$HOME`, `/home/agentbox` | **yours.** `.config`, `.local`, `bin`, `.cache`, `.history`, `.ssh`, everything |
 | `~/project` | the project, bind-mounted from the host. **This is where work belongs** |
 | `/tmp`, `/run`, `/var/tmp` | tmpfs — gone when the box stops |
+
+On the host, `$AGENT_HOME` is this project's `$BOX_HOME` (`<project>/.agentbox/home/`), which was
+seeded from the human's `$BASE_HOME` (`<checkout>/agent_home/`) when the box was created.
 
 Everything else is read-only: `/` (the root filesystem), `/opt/agentbox` (the image),
 `/opt/agentbox/pinned` if present. Writes outside the table fail with
 `Read-only file system`; `/tmp` writes succeed and then disappear, which is worse.
 
-`~/project/.agentbox/` is the host's view of your home — the same files you see at `~`. You *can*
-write there, but don't: it exists so the human can see and copy your home, never as project content.
-Never commit it, and never copy it into `~/project`.
+`~/project/.agentbox/` is the host's view of your home (`$BOX_HOME`) — the same files you see at
+`~`. You *can* write there, but don't: it exists so the human can see and copy your home, never as
+project content. Never commit it, and never copy it into `~/project`.
 
-Your home is **per project**. It was copied from the human's base when this box was created, and it
-belongs to this box alone: an edit never reaches another project. So if a tool or config you need is
-missing, the answer is not "the other project has it" — it isn't mounted.
+Your home is **per project**. It was copied from the human's `$BASE_HOME` when this box was created,
+and it belongs to this box alone: an edit never reaches another project. So if a tool or config you
+need is missing, the answer is not "the other project has it" — it isn't mounted.
 
 ## Hard facts
 
@@ -113,7 +116,7 @@ environment) makes `nvm use` refuse to switch versions — so there is no global
 
 `~/.local/bin` and `~/bin` are on `PATH` and win over the image. Project dependencies belong in the
 project (`node_modules/`, `.venv/`) — do not hoist them into `~/.local`. List what you installed in
-your summary; the human decides whether to promote it to their base or add it to the image.
+your summary; the human decides whether to promote it to their `$BASE_HOME` or add it to the image.
 
 ## Secrets and git
 

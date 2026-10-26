@@ -1,6 +1,12 @@
 # your base $HOME: never published, never tracked
 agent_home/
 
+# this machine's overrides ($APP/local.toml): machine-local, never tracked
+local.toml
+
 # python
 __pycache__/
 *.pyc
+
+# superpowers scratch (ledger, briefs, review packages)
+.superpowers/
