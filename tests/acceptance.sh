@@ -253,6 +253,11 @@ check "an unknown local.toml [sandbox] key exits 2" "[ $rc -eq 2 ]"
 check "the refusal names local.toml" \
   "(cd $A && \"$AB\" status 2>&1 | grep -q 'local.toml')"
 printf 'schema = 1\n[sandbox]\nmemory = "2g"\n' > "$WORK/local.toml"
+printf 'schema = 1\n[sandbox]\nmemory = "2g"\n' > "$WORK/unreadable.toml"
+chmod 000 "$WORK/unreadable.toml"
+(cd "$A" && AGENTBOX_LOCAL="$WORK/unreadable.toml" "$AB" status >/dev/null 2>&1); rc=$?
+check "an unreadable local.toml exits 2, not a traceback" "[ $rc -eq 2 ]"
+chmod 644 "$WORK/unreadable.toml"
 FAKE="$WORK/fakehome"; mkdir -p "$FAKE/.config/agentbox" "$FAKE/.local/share/agentbox"
 check "a missing local.toml is simply absent config" \
   "(cd $A && AGENTBOX_LOCAL=$WORK/nope.toml \"$AB\" status 2>&1 | grep -qE 'memory +4g')"
@@ -267,6 +272,8 @@ check "the refusal names local.toml and the file to move" \
 check "doctor is still reachable with a leftover config" \
   "(cd $A && HOME=$FAKE \"$AB\" doctor 2>&1 | grep -q 'no leftovers') && \
    [ \"\$(cd $A && HOME=$FAKE \"$AB\" doctor >/dev/null 2>&1; echo \$?)\" != 2 ]"
+check "cleanup commands still work with a leftover config" \
+  "(cd $A && HOME=$FAKE \"$AB\" ls >/dev/null 2>&1)"
 rm -f "$FAKE/.config/agentbox/config.toml"
 check "the base is \$APP/agent_home when no override is set" \
   "(cd $A && env -u AGENTBOX_HOME_BASE \"$AB\" home | head -1 | grep -qx '$REPO/agent_home')"

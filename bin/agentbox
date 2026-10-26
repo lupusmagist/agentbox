@@ -118,6 +118,10 @@ def load_toml(path: Path) -> dict:
             return tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         die(f"{path}: {exc}", EXIT_CONFIG)
+    except OSError as exc:
+        # unreadable is a config error, not a traceback: this tool's whole contract
+        # is a named problem and a non-zero code
+        die(f"{path}: {exc.strerror or exc}", EXIT_CONFIG)
 
 
 REFUSE_ROOTS = {"/", "/tmp", "/var/tmp", "/home", "/root", "/usr", "/etc",
@@ -1437,9 +1441,10 @@ examples
 
     args = p.parse_args(argv)
     # --version/--help exit inside parse_args, so a leftover config file never
-    # prevents diagnosing the install. `doctor` is exempt on purpose: it is the
-    # command that reports the leftover, and it never reads the config.
-    if getattr(args, "func", None) is not cmd_doctor:
+    # prevents diagnosing the install. Only the commands that would have READ that
+    # config stop: `doctor` reports it, and `rm`/`stop`/`ls`/`gc` never touch it.
+    func = getattr(args, "func", None)
+    if func is None or func is cmd_status:
         refuse_legacy_state()
     if args.network:
         CLI_OVERRIDE["network"] = args.network
