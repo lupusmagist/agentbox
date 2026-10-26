@@ -20,7 +20,7 @@ project's notes: nothing from another project is mounted here.
 
 | Path | |
 |---|---|
-| `$AGENT_HOME` — `/home/agentbox` | **yours.** `.config`, `.local`, `bin`, `.cache`, `.history`, `.ssh`, everything |
+| `$AGENT_HOME` — your `$HOME`, `/home/agentbox` | **yours.** `.config`, `.local`, `bin`, `.cache`, `.history`, `.ssh`, everything |
 | `~/project` | the project, bind-mounted from the host. **This is where work belongs** |
 | `/tmp`, `/run`, `/var/tmp` | tmpfs — gone when the box stops |
 

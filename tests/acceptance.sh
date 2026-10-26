@@ -264,6 +264,9 @@ check "a leftover \$USER_HOME config exits 2" \
 check "the refusal names local.toml and the file to move" \
   "(cd $A && HOME=$FAKE \"$AB\" status 2>&1 | grep -q 'local.toml' && \
     cd $A && HOME=$FAKE \"$AB\" status 2>&1 | grep -q '.config/agentbox/config.toml')"
+check "doctor is still reachable with a leftover config" \
+  "(cd $A && HOME=$FAKE \"$AB\" doctor 2>&1 | grep -q 'no leftovers') && \
+   [ \"\$(cd $A && HOME=$FAKE \"$AB\" doctor >/dev/null 2>&1; echo \$?)\" != 2 ]"
 rm -f "$FAKE/.config/agentbox/config.toml"
 check "the base is \$APP/agent_home when no override is set" \
   "(cd $A && env -u AGENTBOX_HOME_BASE \"$AB\" home | head -1 | grep -qx '$REPO/agent_home')"

@@ -1437,8 +1437,10 @@ examples
 
     args = p.parse_args(argv)
     # --version/--help exit inside parse_args, so a leftover config file never
-    # prevents diagnosing the install.
-    refuse_legacy_state()
+    # prevents diagnosing the install. `doctor` is exempt on purpose: it is the
+    # command that reports the leftover, and it never reads the config.
+    if getattr(args, "func", None) is not cmd_doctor:
+        refuse_legacy_state()
     if args.network:
         CLI_OVERRIDE["network"] = args.network
     if not getattr(args, "func", None):
