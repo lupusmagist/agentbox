@@ -576,6 +576,14 @@ def image_id(ref: str = f"{IMAGE_REPO}:current") -> str | None:
     return res.stdout.strip() if res.returncode == 0 else None
 
 
+def image_lock_label(ref: str = f"{IMAGE_REPO}:current") -> str | None:
+    """The lock hash baked into the image, so no state file can drift from it."""
+    res = podman("image", "inspect", "--format",
+                 '{{index .Config.Labels "io.agentbox.lock"}}', ref)
+    out = res.stdout.strip()
+    return out if res.returncode == 0 and out and out != "<no value>" else None
+
+
 def ensure_image(build: bool = True) -> None:
     if image_present():
         return
@@ -1145,6 +1153,12 @@ def cmd_doctor(args) -> int:
     img = image_id()
     check(1, "image present and matches tools.lock", bool(img),
           f"id {img[:19]}" if img else "run 'agentbox build'")
+    if img:
+        have = image_lock_label()
+        same = have == lock_hash()
+        check(1, "image label matches lock hash", same,
+              f"lock {lock_hash()} vs image {have or 'no label'}"
+              + ("" if same else " — run 'agentbox build'"))
 
     # 2/3 the box homes hold keys, so none of them may be tracked by git
     boxes = podman_json("ps", "-a", "--filter", f"label={LABEL}", "--format", "json") or []
@@ -1220,6 +1234,10 @@ def cmd_doctor(args) -> int:
     if sh(["docker", "ps", "-a", "--filter", "name=agent-sandbox",
            "--format", "{{.Names}}"]).stdout.strip():
         left.append("container agent-sandbox")
+    # state an older agentbox kept in $USER_HOME: nothing reads it now
+    for p in legacy_paths():
+        if p.exists():
+            left.append(f"{p} (older agentbox state; safe to delete)")
     check(6, "no leftovers from the old setup", not left, ", ".join(left), fatal=False)
 
     # 7 total size of the box homes (caches excluded: they count separately)

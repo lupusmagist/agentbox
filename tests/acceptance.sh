@@ -368,6 +368,16 @@ check "the refusal is visible in a dry run too" \
   "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -qi 'looks like a secret')"
 
 group "doctor"
+LOCKHASH=$(sha256sum "$REPO/tools.lock" | cut -c1-12)
+check "the image carries the lock hash as a label" \
+  "[ \"\$(podman image inspect --format '{{index .Config.Labels \"io.agentbox.lock\"}}' localhost/agentbox/base:current)\" = $LOCKHASH ]"
+check "doctor checks the label, not a state file" \
+  "(cd $A && \"$AB\" doctor 2>&1 | grep -q 'image label matches lock hash')"
+FAKE="$WORK/fakehome"; mkdir -p "$FAKE/.local/share/agentbox"
+check "old \$USER_HOME state is reported by doctor" \
+  "(cd $A && HOME=$FAKE \"$AB\" doctor 2>&1 | grep -qiE 'warn +6 .*leftover')"
+check "old \$USER_HOME state is not fatal" \
+  "(cd $A && HOME=$FAKE \"$AB\" doctor 2>&1 | grep -E '^warn +6 ' >/dev/null)"
 "$AB" doctor >/dev/null 2>&1 && ok "doctor passes with test boxes present" \
   || bad "doctor passes with test boxes present" "$("$AB" doctor 2>&1 | grep FAIL | head -1)"
 
