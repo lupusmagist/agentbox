@@ -1,0 +1,20 @@
+# Machine-wide defaults for every box, versioned in this repo.
+# This is the user-level hardening profile: a project's .agentbox.toml may never
+# override anything in [sandbox] (DESIGN.md §6.3).
+
+[defaults]
+# What every box gets unless a project says otherwise. These are the only keys a
+# project file may also set (a project may tighten the ceilings, never raise them).
+network = "online"        # "online" | "none"  -- opt OUT of networking per project
+memory  = "4g"
+cpus    = 4
+pids    = 512
+
+[sandbox]
+memory        = "4g"
+cpus          = 4
+pids          = 512
+ulimit_nofile = "8192:8192"
+tmpfs_tmp     = "256m"
+tmpfs_run     = "64m"
+tmpfs_vartmp  = "64m"

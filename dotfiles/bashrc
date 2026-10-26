@@ -1,0 +1,34 @@
+# Default shell for agentbox. Plain bash, deliberately small and impersonal.
+#
+# Your own version wins: edit ~/.bashrc inside a box and run
+# `agentbox home push`, or write agent_home/.bashrc on the host.
+#
+# This file is seeded only into a home that has no .bashrc yet.
+
+# --- history: per box, kept in the box home --------------------------------
+export HISTFILE="$HOME/.history/bash_history"
+export HISTSIZE=50000
+export HISTFILESIZE=50000
+export HISTCONTROL=ignoreboth:erasedups
+shopt -s histappend cmdhist checkwinsize
+mkdir -p "$HOME/.history" "$HOME/.cache/bash"
+
+# --- prompt ---------------------------------------------------------------
+PS1='\[\e[1;34m\]\w\[\e[0m\] \$ '
+
+# nvm, if this box has its seeded copy (node from the image is already on PATH;
+# nvm is for other versions: `nvm install 20 && nvm use 20`)
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+    . "${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+fi
+
+# Global npm installs need a writable prefix (~/.npm-global, on PATH). It is
+# passed per command instead of being configured, because a `prefix` in .npmrc or
+# NPM_CONFIG_PREFIX makes `nvm use` refuse to switch node versions.
+if command -v npm >/dev/null 2>&1; then
+    npmg() { npm install -g --prefix "$HOME/.npm-global" "$@"; }
+fi
+
+# ~/bin and ~/.local/bin first, so a tool you install in this box wins
+export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+

@@ -1,0 +1,6 @@
+# your base $HOME: never published, never tracked
+agent_home/
+
+# python
+__pycache__/
+*.pyc

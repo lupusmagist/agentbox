@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+"""agentbox - one rootless sandbox per project, rebuilt from a git recipe.
+
+Single file, stdlib only, python 3.11+.  Design: see DESIGN.md in the repo root.
+Exit codes: 0 ok | 1 runtime failure | 2 config error | 3 image missing
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    sys.exit("agentbox: needs python 3.11+ (tomllib)")
+
+VERSION = "0.1.0"
+SCHEMA = 1
+EXIT_OK, EXIT_FAIL, EXIT_CONFIG, EXIT_NOIMAGE = 0, 1, 2, 3
+
+REPO = Path(__file__).resolve().parent.parent
+SKEL = REPO / "dotfiles"           # default dotfiles, baked into the image
+BASE_HOME = REPO / "agent_home"    # your base $HOME, gitignored (DESIGN.md 16)
+LOCK = REPO / "tools.lock"
+DEFAULTS_FILE = REPO / "defaults.toml"
+AGENT_MD = REPO / "AGENT.md"
+
+DATA = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "agentbox"
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agentbox"
+
+# inside the box
+BOX_HOME = "/home/agentbox"
+BOX_PROJECT = "/home/agentbox/project"
+PROJECT_DIR = ".agentbox"          # per-project state in the project root
+
+IMAGE_REPO = "localhost/agentbox/base"
+LABEL = "io.agentbox.schema"
+
+# Nothing is shared between boxes any more: the box home holds everything, and
+# no agent CLI is baked, so there is no per-agent auth volume to mount.
+
+# Set from global CLI flags in main() and applied last by merged_config, so
+# `agentbox --network online status` means what it says.
+CLI_OVERRIDE: dict = {}
+
+FORBIDDEN_SOURCES = ("/.ssh", "/.gnupg", "/.git-credentials", "/.aws", "/.config/gh",
+                     "/.docker", "/.kube")
+FORBIDDEN_TARGETS = {"/", "/etc", "/root", "/proc", "/sys", "/dev", "/boot", "/var",
+                     "/home/agentbox/.ssh", "/home/agentbox/project/.agentbox",
+                     "/var/run/docker.sock", "/run/user"}
+
+# Keys a *project* may set.  Anything else, and any [sandbox] table, is a hard error.
+PROJECT_KEYS = {"network", "memory", "cpus", "pids", "mounts", "schema"}
+SANDBOX_KEYS = {"memory", "cpus", "pids", "ulimit_nofile",
+                "tmpfs_tmp", "tmpfs_run", "tmpfs_vartmp"}
+
+
+# --------------------------------------------------------------------------- io
+
+def err(msg: str) -> None:
+    print(f"agentbox: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = EXIT_FAIL) -> "None":
+    err(f"error: {msg}")
+    raise SystemExit(code)
+
+
+def note(msg: str) -> None:
+    print(f"agentbox: {msg}")
+
+
+def sh(cmd: list[str], *, check: bool = False, quiet: bool = False,
+       input: str | None = None) -> subprocess.CompletedProcess:
+    if not quiet:
+        pass
+    try:
+        return subprocess.run(cmd, text=True, input=input, capture_output=True,
+                              check=check)
+    except FileNotFoundError:
+        die(f"{cmd[0]} not found on PATH", EXIT_FAIL)
+    except subprocess.CalledProcessError as exc:
+        die(f"{' '.join(cmd)} failed ({exc.returncode}): {(exc.stderr or '').strip()}")
+
+
+def podman(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+    return sh(["podman", *args], check=check)
+
+
+def podman_json(*args: str):
+    res = podman(*args)
+    if res.returncode != 0:
+        return None
+    try:
+        return json.loads(res.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+
+
+# ----------------------------------------------------------------------- config
+
+def load_toml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        die(f"{path}: {exc}", EXIT_CONFIG)
+
+
+REFUSE_ROOTS = {"/", "/tmp", "/var/tmp", "/home", "/root", "/usr", "/etc",
+                str(Path.home())}
+
+
+def project_root(start: Path | None = None) -> Path:
+    cur = (start or Path.cwd()).resolve()
+    found = None
+    for cand in [cur, *cur.parents]:
+        if (cand / ".agentbox.toml").exists():
+            found = cand
+            break
+    root = found or cur
+    if found is None and (str(root) in REFUSE_ROOTS or str(root).startswith("/proc")):
+        die(f"no project here: {root} has no .agentbox.toml and is not a project "
+            "directory\n       cd into a project — the first 'agentbox' there writes "
+            "its .agentbox.toml",
+            EXIT_CONFIG)
+    return root
+
+
+def ident(root: Path) -> tuple[str, str]:
+    slug = re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-")[:24] or "project"
+    digest = hashlib.sha256(str(root).encode()).hexdigest()[:8]
+    return slug, digest
+
+
+def box_name(root: Path, lab: bool = False) -> str:
+    slug, h = ident(root)
+    return f"agentbox-{'lab-' if lab else ''}{slug}-{h}"
+
+
+# --------------------------------------------------------------- the box $HOME
+#
+# $HOME inside a box is a real, writable directory, seeded once per project by
+# copying the base and then left alone:
+#
+#   agent_home/                  your base $HOME, next to this CLI, gitignored
+#   <project>/.agentbox/home/    the copy a box runs on (keys live here)
+#   <project>/.agentbox/home/.cache/   disposable, never pushed to the base
+#
+# `agentbox home push` copies changes back into the base. New boxes inherit the
+# base; boxes that already exist keep their own copy until `agentbox home sync`.
+# See DESIGN.md 16.
+
+def base_home() -> Path:
+    """The base $HOME: agent_home/ next to the CLI, or [home] base in config."""
+    env = os.environ.get("AGENTBOX_HOME_BASE")
+    if env:
+        return Path(env).expanduser()
+    conf = load_toml(CONF_DIR / "config.toml")
+    where = (conf.get("home") or {}).get("base")
+    if where:
+        return Path(str(where)).expanduser()
+    return BASE_HOME
+
+
+def box_home(root: Path) -> Path:
+    return root / PROJECT_DIR / "home"
+
+
+def home_size(root: Path) -> tuple[int, int]:
+    """(files, bytes) in this box's home, caches excluded."""
+    home = box_home(root)
+    if not home.is_dir():
+        return 0, 0
+    files = size = 0
+    for f in home.rglob("*"):
+        rel = f.relative_to(home).as_posix()
+        if rel != ".cache" and not rel.startswith(".cache/"):
+            if f.is_file() and not f.is_symlink():
+                files += 1
+                try:
+                    size += f.stat().st_size
+                except OSError:
+                    pass
+    return files, size
+
+
+def ensure_git_excluded(root: Path) -> None:
+    """Keep .agentbox/ out of git locally (never edits a tracked .gitignore)."""
+    if not (root / ".git").is_dir():
+        return
+    ex = root / ".git" / "info" / "exclude"
+    cur = ex.read_text() if ex.exists() else ""
+    if any(l.strip().rstrip("/") == ".agentbox" for l in cur.splitlines()):
+        return
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    add = ("" if not cur or cur.endswith("\n") else "\n") + ".agentbox/\n"
+    ex.write_text(cur + add)
+
+
+def tracked_home_files(root: Path) -> list[str]:
+    res = sh(["git", "-C", str(root), "ls-files", PROJECT_DIR])
+    return [l for l in res.stdout.splitlines() if l.strip()]
+
+
+# What `home push` moves by default, and what it never moves.
+HOME_PUSH_DEFAULT = (".bashrc", ".bash_profile", ".profile", ".gitconfig",
+                     ".dir_colors", ".config", "bin", ".local/bin")
+HOME_NEVER = (".cache", ".ssh", ".pi", ".gnupg", ".netrc", ".history",
+              ".local/state", ".local/share/uv/cache")
+JUNK_DIRS = {"node_modules", ".venv", "__pycache__", ".mypy_cache",
+             ".pytest_cache", ".ruff_cache", ".git"}
+KEY_SHAPED = re.compile(r"(^id_[a-z0-9]+(\.pub)?$|\.(pem|key|p12|pfx|keystore)$"
+                        r"|(^|/)\.netrc$|(^|/)credentials$)")
+# Long-lived credentials have recognisable prefixes; a file containing one must not
+# be promoted into the base, where it would be copied into every future box.
+SECRET_CONTENT = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+
+
+def home_rel_allowed(rel: str) -> bool:
+    """False for keys, caches, package stores and editor/tool junk."""
+    for never in HOME_NEVER:
+        if rel == never or rel.startswith(never + "/"):
+            return False
+    if any(part in JUNK_DIRS for part in Path(rel).parts):
+        return False
+    return not KEY_SHAPED.search(Path(rel).name)
+
+
+def home_plan(src: Path, dst: Path, paths=HOME_PUSH_DEFAULT,
+              limit: int = 50 * 1024 * 1024):
+    """Files under src/<p> that differ from dst/<p>, plus what was skipped."""
+    copy: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for p in paths:
+        base = src / p
+        if not base.exists():
+            continue
+        items = [base] if base.is_file() else sorted(x for x in base.rglob("*") if x.is_file())
+        for f in items:
+            rel = f.relative_to(src).as_posix()
+            if f.is_symlink():
+                skipped.append((rel, "symlink"))
+                continue
+            if not home_rel_allowed(rel):
+                skipped.append((rel, "keys/cache/junk"))
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if size > limit:
+                skipped.append((rel, f"{size // 1024} KiB — too large"))
+                continue
+            try:
+                head = f.open("rb").read(4096).decode("utf-8", "ignore")
+            except OSError:
+                continue
+            if SECRET_CONTENT.search(head):
+                skipped.append((rel, "looks like a secret"))
+                continue
+            target = dst / rel
+            if target.is_file() and not target.is_symlink():
+                try:
+                    if target.stat().st_size == size and \
+                            open(f, "rb").read() == open(target, "rb").read():
+                        continue
+                except OSError:
+                    pass
+            copy.append(rel)
+    return copy, skipped
+
+
+def ensure_home(root: Path, quiet: bool = False) -> str:
+    """Seed <project>/.agentbox/home once. Returns kept|seeded|empty."""
+    home = box_home(root)
+    ensure_git_excluded(root)
+    tracked = tracked_home_files(root)
+    if tracked:
+        die(f"{PROJECT_DIR}/ is tracked by git, and it holds your $HOME and any keys in it:\n"
+            "       " + "\n       ".join(tracked[:5]) + "\n"
+            f"       fix: git rm -r --cached {PROJECT_DIR} && git commit", EXIT_CONFIG)
+    if home.is_dir():
+        return "kept"
+    home.mkdir(parents=True, exist_ok=True)
+    for d in (".config", ".local/bin", ".local/share", ".cache", ".history",
+              "bin", "project"):
+        (home / d).mkdir(parents=True, exist_ok=True)
+    # the agent contract lives in the image (read-only); link it rather than
+    # bind-mounting a file into the home, which would leave empty files on the host
+    for name in ("AGENT.md", "AGENTS.md"):
+        link = home / name
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to("/opt/agentbox/AGENT.md")
+    base = base_home()
+    if not base.is_dir():
+        if not quiet:
+            note(f"no base yet at {base} — this box starts from the defaults "
+                 f"(configure it, then 'agentbox home push')")
+        return "empty"
+    entries = [e for e in sorted(base.iterdir()) if e.name not in (".cache", ".ssh")]
+    if not entries:
+        if not quiet:
+            note(f"the base at {base} is empty — this box starts from the defaults "
+                 f"(configure it, then 'agentbox home push')")
+        return "empty"
+    for entry in entries:
+        dst = home / entry.name
+        if entry.is_dir():
+            # copy the *contents*: the destination directory already exists, and
+            # `cp -a base/.config home/.config` would nest one level deeper
+            dst.mkdir(parents=True, exist_ok=True)
+            src = f"{entry}/."
+        else:
+            src = str(entry)
+        res = sh(["cp", "-a", "--reflink=auto", src, str(dst)], quiet=True)
+        if res.returncode != 0:
+            note(f"could not copy {entry} into the box home: "
+                 f"{(res.stderr or '').strip()}")
+    if not quiet:
+        note(f"seeded the box home from {base}")
+    return "seeded"
+
+
+# ------------------------------------------------------------ box selection
+
+def all_boxes() -> list[dict]:
+    """Every box on the machine, flattened for listing and selection."""
+    data = podman_json("ps", "-a", "--filter", f"label={LABEL}",
+                       "--format", "json") or []
+    out = []
+    for c in data:
+        labels = c.get("Labels") or {}
+        path = labels.get("io.agentbox.path") or ""
+        out.append({
+            "name": "/".join(c.get("Names") or []),
+            "project": labels.get("io.agentbox.project", "?"),
+            "path": path,
+            "hash": ident(Path(path))[1] if path else "",
+            "state": c.get("State", "?"),
+            "kind": "lab" if labels.get("io.agentbox.lab") == "1" else "-",
+            "net": labels.get("io.agentbox.network", "?"),
+        })
+    return out
+
+
+def resolve_boxes(sel: str | None) -> list[dict]:
+    """Boxes named by a selector, so commands work from any directory.
+
+    Accepted, in order: nothing (this project), a path, an exact container name
+    with or without the 'agentbox-' prefix, or a project name. A project name is
+    only accepted when it is unambiguous; two projects with the same basename are
+    told apart by the container name that `agentbox ls` prints.
+    """
+    boxes = all_boxes()
+    if not sel:
+        _, h = ident(project_root())
+        return [b for b in boxes if b["hash"] == h]
+
+    s = sel.strip()
+    if s.startswith(("/", "./", "../", "~")):
+        _, h = ident(Path(s).expanduser().resolve())
+        return [b for b in boxes if b["hash"] == h]
+
+    named = [b for b in boxes if b["name"] in (s, f"agentbox-{s}")]
+    if named:
+        return named
+
+    slug = s.lower()
+    matching = [b for b in boxes if b["project"] == slug]
+    if len(matching) == 1:
+        return matching
+    if matching:
+        lines = "\n".join(f"       {b['name']}  {b['path']}" for b in matching)
+        die(f"{len(matching)} boxes belong to projects called {s!r}:\n{lines}\n"
+            "       use the NAME from 'agentbox ls' instead", EXIT_CONFIG)
+
+    known = ", ".join(sorted({b["project"] or "?" for b in boxes})) or "none"
+    die(f"no box matches {s!r}\n"
+        f"       boxes on this machine: {known}\n"
+        "       'agentbox ls' lists them; omit the argument to use the current directory",
+        EXIT_CONFIG)
+
+
+def one_box(sel: str | None, lab: bool = False) -> dict:
+    boxes = resolve_boxes(sel)
+    if not boxes:
+        die(f"no box for {project_root()} (run 'agentbox up')", EXIT_FAIL)
+    if len(boxes) > 1:
+        want = "lab" if lab else "-"
+        boxes = [b for b in boxes if b["kind"] == want] or boxes
+    return boxes[0]
+
+
+def to_bytes(value) -> int:
+    """'4g' / '512m' / '1073741824' -> bytes."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmg])?b?\s*", str(value).lower())
+    if not m:
+        raise ValueError(value)
+    mult = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, None: 1}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
+def merged_config(root: Path, cli: dict | None = None) -> dict:
+    """CLI > project > user config > defaults.toml > built-in."""
+    builtin = {"network": "none", "memory": "4g", "cpus": 4, "pids": 512,
+               "mounts": [], "schema": SCHEMA,
+               "ulimit_nofile": "8192:8192", "tmpfs_tmp": "256m",
+               "tmpfs_run": "64m", "tmpfs_vartmp": "64m"}
+
+    defaults = load_toml(DEFAULTS_FILE)
+    user = load_toml(CONF_DIR / "config.toml")
+    proj_path = root / ".agentbox.toml"
+    proj = load_toml(proj_path)
+
+    # --- escalation rule: a project may not touch hardening keys -----------
+    if proj:
+        bad = set(proj) - PROJECT_KEYS
+        if "sandbox" in proj or bad:
+            names = ", ".join(sorted(set(bad) - {""})) or "sandbox"
+            allowed = ", ".join(sorted(PROJECT_KEYS - {"schema"}))
+            die(f"{proj_path.name} may not set {names}\n"
+                f"       a project may set only: {allowed}\n"
+                "       anything else is either a preference (put it in your home) or "
+                "hardening\n"
+                f"       (user-level only, in {DEFAULTS_FILE} or {CONF_DIR / 'config.toml'})",
+                EXIT_CONFIG)
+        if proj.get("schema", SCHEMA) != SCHEMA:
+            die(f"{proj_path.name}: unsupported schema {proj.get('schema')} "
+                f"(this agentbox speaks {SCHEMA})", EXIT_CONFIG)
+
+    cfg = dict(builtin)
+    for layer in (defaults.get("defaults", {}), user.get("defaults", {}), proj):
+        for key, val in layer.items():
+            if key in cfg or key == "provider_keys":
+                cfg[key] = val
+    for key, val in (defaults.get("sandbox") or {}).items():
+        if key not in SANDBOX_KEYS:
+            die(f"{DEFAULTS_FILE}: unknown [sandbox] key {key!r}", EXIT_CONFIG)
+        cfg[key] = val
+    # A project may TIGHTEN a limit but never loosen one: the machine profile in
+    # [sandbox] is the ceiling. Silently ignoring the project value (which is what
+    # a plain merge did) made .agentbox.toml's memory/cpus/pids a lie.
+    for key in ("memory", "cpus", "pids"):
+        if key not in proj:
+            continue
+        ceiling, want = cfg.get(key), proj[key]
+        try:
+            looser = (to_bytes(want) > to_bytes(ceiling)) if key == "memory" \
+                else int(want) > int(ceiling)
+        except (TypeError, ValueError):
+            die(f"{proj_path.name}: {key} = {want!r} is not a valid limit", EXIT_CONFIG)
+        if looser:
+            die(f"{proj_path.name}: {key} = {want} would loosen the sandbox "
+                f"(ceiling {ceiling} from {DEFAULTS_FILE})\n"
+                f"       raise it in {DEFAULTS_FILE} [sandbox] if every project should "
+                "get more", EXIT_CONFIG)
+        cfg[key] = want
+    for key, val in (user.get("sandbox") or {}).items():
+        if key in SANDBOX_KEYS:
+            cfg[key] = val
+    for key, val in CLI_OVERRIDE.items():
+        if val is not None:
+            cfg[key] = val
+    for key, val in (cli or {}).items():
+        if val is not None:
+            cfg[key] = val
+    return cfg
+
+
+def validate(cfg: dict, root: Path) -> None:
+    # The box home holds keys, so it must never be tracked. This runs on every
+    # command, not just on creation: a stray `git add` is caught immediately.
+    tracked = tracked_home_files(root)
+    if tracked:
+        die(f"{PROJECT_DIR}/ is tracked by git, and it holds your $HOME and any keys "
+            "in it:\n       " + "\n       ".join(tracked[:5])
+            + f"\n       fix: git rm -r --cached {PROJECT_DIR} && git commit",
+            EXIT_CONFIG)
+    if cfg["network"] not in ("none", "online"):
+        die(f"network must be 'none' or 'online', not {cfg['network']!r}", EXIT_CONFIG)
+    for spec in cfg["mounts"] or []:
+        parts = str(spec).split(":")
+        if len(parts) < 2 or len(parts) > 3:
+            die(f"bad mount {spec!r}, expected ./src:/dst[:ro]", EXIT_CONFIG)
+        src, dst = parts[0], parts[1]
+        opts = parts[2] if len(parts) == 3 else "ro"
+        if set(opts.split(",")) - {"ro", "rw", "z", "Z"}:
+            die(f"bad mount options {opts!r} (ro, rw only)", EXIT_CONFIG)
+        resolved = (root / src).resolve() if not Path(src).is_absolute() else Path(src).resolve()
+        if not str(resolved).startswith(str(root)):
+            die(f"mount source {src!r} resolves outside the project root", EXIT_CONFIG)
+        if dst in FORBIDDEN_TARGETS or dst.startswith(("/proc", "/sys", "/dev", "/etc")):
+            die(f"mount target {dst!r} is not allowed", EXIT_CONFIG)
+    for key in ("memory", "cpus", "pids"):
+        if cfg[key] is None:
+            die(f"{key} must be set", EXIT_CONFIG)
+
+
+# ------------------------------------------------------------------------ image
+
+def lock_data() -> dict:
+    if not LOCK.exists():
+        die(f"missing {LOCK}", EXIT_CONFIG)
+    try:
+        return json.loads(LOCK.read_text())
+    except json.JSONDecodeError as exc:
+        die(f"{LOCK}: {exc}", EXIT_CONFIG)
+
+
+def short_hash() -> str:
+    """Identify the exact CLI source, so 'agentbox --version' is meaningful."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]
+    except OSError:
+        return "unknown"
+
+
+def lock_hash() -> str:
+    return hashlib.sha256(LOCK.read_bytes()).hexdigest()[:12]
+
+
+def image_tag() -> str:
+    return f"{IMAGE_REPO}:{datetime.now():%Y%m%d}-{lock_hash()[:7]}"
+
+
+def image_present() -> bool:
+    return podman("image", "exists", f"{IMAGE_REPO}:current").returncode == 0
+
+
+def image_id(ref: str = f"{IMAGE_REPO}:current") -> str | None:
+    res = podman("image", "inspect", "--format", "{{.Id}}", ref)
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def ensure_image(build: bool = True) -> None:
+    if image_present():
+        return
+    if not build:
+        die(f"image {IMAGE_REPO}:current missing (run 'agentbox build')", EXIT_NOIMAGE)
+    do_build()
+
+
+def do_build() -> None:
+    lock = lock_data()
+    base = lock["base"]
+    base_ref = f"{base['image']}@{base['digest']}"
+
+    tools = lock.get("tools", {})
+    tag = image_tag()
+
+    note(f"building {tag} from {base_ref}")
+    cmd = ["podman", "build", "-t", tag, "-t", f"{IMAGE_REPO}:current",
+           "--build-arg", f"BASE_IMAGE={base_ref}",
+
+           # the package list lives in tools.lock, not in the Containerfile
+           "--build-arg", "PACKAGES=" + " ".join(lock.get("packages") or []),
+           "--build-arg", f"NVM_COMMIT={tools.get('nvm', {}).get('commit', 'HEAD')}",
+           "--label", f"io.agentbox.lock={lock_hash()}",
+           "-f", str(REPO / "Containerfile"), str(REPO)]
+    res = subprocess.run(cmd)
+    if res.returncode != 0:
+        die("build failed", EXIT_FAIL)
+    iid = image_id()
+    DATA.mkdir(parents=True, exist_ok=True)
+    (DATA / "image.json").write_text(json.dumps(
+        {"tag": tag, "id": iid, "lock": lock_hash(),
+         "built": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=2))
+    note(f"built {tag}")
+    print(f"  id: {iid}")
+
+
+# ------------------------------------------------------------------- container
+
+def container_state(name: str) -> str:
+    res = podman("container", "inspect", "--format", "{{.State.Status}}", name)
+    if res.returncode != 0:
+        return "absent"
+    return res.stdout.strip() or "absent"
+
+
+def container_labels(name: str) -> dict:
+    res = podman("container", "inspect", "--format",
+                 '{{index .Config.Labels "io.agentbox.project"}}|'
+                 '{{index .Config.Labels "io.agentbox.digest"}}|'
+                 '{{index .Config.Labels "io.agentbox.network"}}|'
+                 '{{index .Config.Labels "io.agentbox.lab"}}', name)
+    if res.returncode != 0:
+        return {}
+    parts = (res.stdout.strip().split("|") + ["", "", "", ""])[:4]
+    return dict(zip(("project", "digest", "network", "lab"), parts))
+
+
+def build_run_args(cfg: dict, root: Path, lab: bool) -> list[str]:
+    name = box_name(root, lab)
+    slug, _h = ident(root)
+    home = box_home(root)
+    ensure_home(root)
+
+    args = ["run", "-d", "--name", name,
+            "--label", f"{LABEL}={SCHEMA}",
+            "--label", f"io.agentbox.project={slug}",
+            "--label", f"io.agentbox.path={root}",
+            "--label", f"io.agentbox.digest={image_id() or 'unknown'}",
+            "--label", f"io.agentbox.network={cfg['network']}",
+            "--label", f"io.agentbox.cfg={cfg_signature(cfg, lab)}",
+            "--label", f"io.agentbox.lab={1 if lab else 0}",
+            "--userns=keep-id", "--user", "1000:1000",
+            "--read-only",
+            "--tmpfs", f"/tmp:rw,size={cfg['tmpfs_tmp']}",
+            "--tmpfs", f"/run:rw,size={cfg['tmpfs_run']}",
+            "--tmpfs", f"/var/tmp:rw,size={cfg['tmpfs_vartmp']}",
+            "--cap-drop", "ALL",
+            # exactly one capability, and only so that `ping` can open a raw socket
+            # (rootless podman refuses the unprivileged-ICMP sysctl, and a setuid
+            # ping would need the setuid bit this image strips). Raw sockets are
+            # confined to this container's own network namespace, and mean nothing
+            # when network = "none".
+            "--cap-add", "NET_RAW",
+            "--security-opt", "no-new-privileges",
+            "--pids-limit", str(cfg["pids"]),
+            "--memory", str(cfg["memory"]),
+            "--cpus", str(cfg["cpus"]),
+            "--ulimit", f"nofile={cfg['ulimit_nofile']}",
+            "--network", "none" if cfg["network"] == "none" else "pasta",
+            "--workdir", BOX_PROJECT,
+            # rootless keep-id derives HOME from the HOST passwd, which would point
+            # at your real home; pin it, and keep the box user's name consistent
+            "-e", f"HOME={BOX_HOME}",
+            "-e", "USER=agentbox",
+            "-e", "LOGNAME=agentbox",
+            "-e", f"AGENTBOX_PROJECT={slug}",
+            "-e", f"AGENTBOX_PATH={root}",
+            "-e", f"AGENTBOX_NETWORK={cfg['network']}",
+            "-e", f"AGENTBOX_LAB={1 if lab else 0}",
+            "-e", f"AGENTBOX_SCHEMA={SCHEMA}",
+            # no baked ~/.gitconfig: the agent's commit identity comes from the
+            # environment, so it stays filterable and you can still override it
+            # with your own .gitconfig in the base home
+            "-e", "GIT_AUTHOR_NAME=Agent Box",
+            "-e", "GIT_AUTHOR_EMAIL=agent@agentbox.local",
+            "-e", "GIT_COMMITTER_NAME=Agent Box",
+            "-e", "GIT_COMMITTER_EMAIL=agent@agentbox.local",
+            ]
+
+    # $HOME first, then the project inside it: podman applies mounts in order, so
+    # the project lands inside the home rather than being shadowed by it.
+    args += ["-v", f"{home}:{BOX_HOME}:rw,z",
+             "-v", f"{root}:{BOX_PROJECT}:rw,z",
+             ]
+
+    for spec in cfg["mounts"] or []:
+        parts = str(spec).split(":")
+        src = str((root / parts[0]).resolve()) if not Path(parts[0]).is_absolute() else parts[0]
+        opts = parts[2] if len(parts) == 3 else "ro"
+        if "z" not in opts and "Z" not in opts:
+            opts += ",z"
+        args += ["-v", f"{src}:{parts[1]}:{opts}"]
+
+    if lab:
+        args += ["--device", "/dev/kvm"]
+
+    args += [f"{IMAGE_REPO}:current"]
+    return args
+
+
+def dir_label_ok(root: Path) -> bool:
+    """True unless SELinux is enforcing and the project dir lost its container label."""
+    res = sh(["getenforce"])
+    if res.returncode != 0 or res.stdout.strip() != "Enforcing":
+        return True
+    out = sh(["ls", "-dZ", str(root)]).stdout
+    return "container_file_t" in out
+
+
+BOX_CFG_KEYS = ("network", "memory", "cpus", "pids", "mounts",
+                "ulimit_nofile", "tmpfs_tmp", "tmpfs_run", "tmpfs_vartmp")
+
+
+def cfg_signature(cfg: dict, lab: bool) -> str:
+    """Hash of everything that ends up in the container's run arguments.
+
+    Without this, editing .agentbox.toml appears to work while the old container
+    keeps running with the old network mode or limits.
+    """
+    body = {k: cfg.get(k) for k in BOX_CFG_KEYS}
+    body["lab"] = bool(lab)
+    body["_repo"] = str(REPO)
+    body["_base_home"] = str(base_home())
+    body["_agent_md"] = str(AGENT_MD)
+    blob = json.dumps(body, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def ensure_box(cfg: dict, root: Path, lab: bool, build: bool = True) -> str:
+    name = box_name(root, lab)
+    state = container_state(name)
+    ensure_image(build)
+    if state != "absent" and not dir_label_ok(root):
+        note(f"{root} lost its SELinux label (directory replaced?) — recreating {name}")
+        podman("rm", "-f", name)
+        state = "absent"
+    if state != "absent":
+        want = cfg_signature(cfg, lab)
+        have = podman("inspect", "--format",
+                      '{{index .Config.Labels "io.agentbox.cfg"}}', name).stdout.strip()
+        if have != want:
+            note(f"config changed since {name} was created — recreating it")
+            podman("rm", "-f", name)
+            state = "absent"
+    if state == "absent":
+        note(f"creating {name}")
+        res = podman(*build_run_args(cfg, root, lab))
+        if res.returncode != 0:
+            die((res.stderr or "podman run failed").strip(), EXIT_FAIL)
+    elif state in ("exited", "created", "stopped"):
+        note(f"starting {name}")
+        res = podman("start", name)
+        if res.returncode != 0:
+            die((res.stderr or "podman start failed").strip(), EXIT_FAIL)
+    return name
+
+
+def exec_in(name: str, cmd: list[str], interactive: bool = False,
+            tty: bool = False) -> int:
+    args = ["exec"]
+    if interactive:
+        args.append("-i")
+    if tty:
+        args.append("-t")
+    args += ["-e", "TERM=xterm-256color", name, *cmd]
+    # always inherit stdio: exec is a passthrough, not a capture
+    return subprocess.run(["podman", *args]).returncode
+
+
+# -------------------------------------------------------------------- commands
+
+def cmd_build(args) -> int:
+    do_build()
+    return EXIT_OK
+
+
+def cmd_enter(args) -> int:
+    """The whole surface for daily use: create this project's box, then enter it.
+
+    With no terminal (a script, a pipe, CI) it creates the box and prints its
+    name instead of trying to hand over a shell.
+    """
+    root = project_root()
+    ensure_project_config(root)
+    cfg = merged_config(root, {"network": getattr(args, "network", None)})
+    validate(cfg, root)
+    lab = bool(getattr(args, "lab", False))
+    name = ensure_box(cfg, root, lab)
+    slug, _ = ident(root)
+    note(" ".join([f"project={slug}", f"network={cfg['network']}",
+                   f"lab={'on' if lab else 'off'}"]))
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(name)
+        return EXIT_OK
+    note("read ~/AGENT.md (capabilities), then ./AGENTS.md (project rules)")
+    sys.stdout.flush()
+    # -i, not -l: a login shell reads /etc/profile and ~/.bash_profile but never
+    # ~/.bashrc, so the operator's aliases and our history settings would be
+    # silently ignored in the shell this command exists to give you.
+    rc = exec_in(name, ["/bin/bash", "-i"], interactive=True, tty=True)
+    # Leaving the shell stops the box. Nothing of yours lives in the container, so
+    # keeping it running only holds memory and pids — and a process that wedged
+    # the session cannot outlive it. The next `agentbox` starts it again.
+    if container_state(name) == "running":
+        res = podman("stop", "--time", "5", name)
+        if res.returncode == 0:
+            note(f"stopped {name}")
+        else:
+            note(f"could not stop {name}: {(res.stderr or '').strip()}")
+    return rc or EXIT_OK
+
+
+def cmd_status(args) -> int:
+    sel = getattr(args, "target", None)
+    if sel:
+        # Works from anywhere, and still describes a box whose directory is gone.
+        for b in resolve_boxes(sel):
+            print(f"project   {b['project']}  ({b['path']})")
+            print(f"container {b['name']}  [{b['state']}]")
+            print(f"network   {b['net']}   kind "
+                  f"{'lab (/dev/kvm)' if b['kind'] == 'lab' else 'default'}")
+            root = Path(b["path"])
+            if root.is_dir():
+                try:
+                    cfg = merged_config(root)
+                    print(f"memory    {cfg['memory']}   cpus {cfg['cpus']}   "
+                          f"pids {cfg['pids']}")
+                except SystemExit:
+                    pass
+            else:
+                print("path      MISSING - the project directory no longer exists; "
+                      f"drop the box with 'agentbox rm {b['name']}'")
+            print()
+        return EXIT_OK
+    root = project_root()
+    cfg = merged_config(root)
+    validate(cfg, root)
+    slug, h = ident(root)
+    print(f"project   {slug}  ({root})")
+    print(f"container {box_name(root)}  [{container_state(box_name(root))}]")
+    lab = box_name(root, True)
+    if container_state(lab) != "absent":
+        print(f"lab       {lab}  [{container_state(lab)}]")
+    img = image_id()
+    print(f"image     {'present' if img else 'MISSING'}  {(img or '')[:19]}")
+    base = base_home()
+    files, size = home_size(root)
+    print(f"home      {box_home(root)}  ({files} files, {size // 1024} KiB, cache excluded)")
+    if base.is_dir():
+        print(f"base      {base}  ({sum(1 for _ in base.rglob('*') if _.is_file())} files)")
+    else:
+        print(f"base      none yet ({base} does not exist) — 'agentbox home push' creates it")
+    print(f"network   {cfg['network']}"
+          + ("   (no route in or out)" if cfg["network"] == "none" else ""))
+    if not (root / ".agentbox.toml").exists():
+        print(f"config    MISSING — 'agentbox' will write {PROJECT_DIR}.toml before it starts")
+    print(f"memory    {cfg['memory']}   cpus {cfg['cpus']}   pids {cfg['pids']}")
+    return EXIT_OK
+
+
+def cmd_ls(args) -> int:
+    data = podman_json("ps", "-a", "--filter", f"label={LABEL}",
+                       "--format", "json") or []
+    if not data:
+        print("no boxes on this machine (run 'agentbox' inside a project)")
+        return EXIT_OK
+    rows = [(b["name"], b["project"], b["state"], b["kind"], b["net"], b["path"])
+            for b in all_boxes()]
+    head = ("NAME", "PROJECT", "STATE", "KIND", "NET", "PATH")
+    widths = [max(len(str(r[i])) for r in rows + [head]) for i in range(6)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths[:5]) + "  {}"
+    print(fmt.format(*head))
+    for r in rows:
+        print(fmt.format(*r))
+    return EXIT_OK
+
+
+def cmd_stop(args) -> int:
+    boxes = resolve_boxes(getattr(args, "target", None))
+    running = [b for b in boxes if b["state"] == "running"]
+    if not running:
+        note("no running box to stop")
+        return EXIT_OK
+    for b in running:
+        podman("stop", b["name"])
+        note(f"stopped {b['name']}")
+    return EXIT_OK
+
+
+def cmd_rm(args) -> int:
+    sel = getattr(args, "target", None)
+    boxes = resolve_boxes(sel)
+    if not boxes:
+        if sel:
+            die(f"no box matches {sel!r} (see 'agentbox ls')", EXIT_CONFIG)
+        root = project_root()
+        note(f"no box for {root}")
+        if getattr(args, "home", False) and box_home(root).is_dir():
+            shutil.rmtree(box_home(root))
+            note(f"removed {box_home(root)}")
+        return EXIT_OK
+    for b in boxes:
+        podman("rm", "-f", b["name"])
+        note(f"removed {b['name']}")
+        p = Path(b["path"])
+        if not p.is_dir():
+            note(f"  its project directory is gone too ({b['path']}) — nothing "
+                 "else to clean: the box home lived inside it")
+        elif getattr(args, "home", False):
+            h = box_home(p)
+            if h.is_dir():
+                shutil.rmtree(h)
+                note(f"  removed {h} (the next 'agentbox' seeds a fresh copy)")
+    return EXIT_OK
+
+
+def cmd_logs(args) -> int:
+    nm = one_box(getattr(args, "target", None), bool(getattr(args, "lab", False)))["name"]
+    cmd = ["podman", "logs"]
+    if args.follow:
+        cmd.append("-f")
+    cmd.append(nm)
+    return subprocess.run(cmd).returncode
+
+
+PROJECT_TEMPLATE = """schema = 1
+
+# network: "online" gets outbound NAT (the default), "none" has no route in or
+# out — the only mode that stops an agent exfiltrating anything
+network = "online"
+
+# ceilings, tighten-only: these may be lower than defaults.toml, never higher
+memory = "4g"
+cpus   = 4
+pids   = 512
+
+# extra mounts must resolve inside this project; read-only unless you say otherwise
+# mounts = ["./fixtures:/fixtures:ro"]
+"""
+
+
+def ensure_project_config(root: Path) -> bool:
+    """Every box is configured by its project file. Create it if it is missing."""
+    path = root / ".agentbox.toml"
+    if path.exists():
+        return False
+    path.write_text(PROJECT_TEMPLATE)
+    note(f"wrote {path} (network online; edit it to tighten or disconnect this project)")
+    return True
+
+
+def _report_skipped(skipped) -> None:
+    if not skipped:
+        return
+    keys = [rel for rel, why in skipped if "keys" in why or "too large" in why]
+    print(f"skipped {len(skipped)} file(s) (caches, junk, symlinks, oversized, secrets)")
+    for rel, why in skipped[:6]:
+        print(f"  {rel}  [{why}]")
+    if keys:
+        print("  keys and oversized files never travel automatically; copy those by hand")
+
+
+def cmd_home(args) -> int:
+    action = args.action
+    root = project_root()
+    home = box_home(root)
+    base = base_home()
+
+    if action in ("path", "open"):
+        print(base)
+        print(f"each project keeps its own copy at <project>/{PROJECT_DIR}/home/")
+        if action == "open":
+            if sys.stdin.isatty() and shutil.which("xdg-open"):
+                subprocess.run(["xdg-open", str(base)])
+            else:
+                note("not opening: no desktop session attached")
+        return EXIT_OK
+
+    if action == "reset":
+        if not home.is_dir():
+            note(f"no box home at {home}")
+            return EXIT_OK
+        if not args.yes:
+            die(f"this deletes {home} — everything the box configured there, keys "
+                "included. Re-run with --yes", EXIT_CONFIG)
+        shutil.rmtree(home)
+        note(f"removed {home}; the next 'agentbox' seeds a fresh copy")
+        nm = box_name(root)
+        if container_state(nm) != "absent":
+            podman("rm", "-f", nm)
+            note(f"removed {nm} (it was holding the old home)")
+        return EXIT_OK
+
+    if action == "push":
+        if not home.is_dir():
+            die(f"no box home at {home} yet — start the box first, configure it, "
+                "then push", EXIT_CONFIG)
+        paths = tuple(args.paths) if args.paths else HOME_PUSH_DEFAULT
+        copy, skipped = home_plan(home, base, paths)
+        if not copy:
+            note(f"nothing to push: {base} already matches this box")
+            _report_skipped(skipped)
+            return EXIT_OK
+        print(f"{len(copy)} file(s) would change in {base}:")
+        for rel in copy[:40]:
+            print(f"  {rel}")
+        if len(copy) > 40:
+            print(f"  ... and {len(copy) - 40} more")
+        _report_skipped(skipped)
+        if args.dry_run:
+            note("dry run: nothing copied")
+            return EXIT_OK
+        base.mkdir(parents=True, exist_ok=True)
+        for rel in copy:
+            dst = base / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            sh(["cp", "-a", "--reflink=auto", str(home / rel), str(dst)], quiet=True)
+        note(f"pushed {len(copy)} file(s) to {base}")
+        note("only NEW boxes inherit the base. Existing boxes keep their own copy — "
+             "run 'agentbox home sync' inside one to re-apply it.")
+        return EXIT_OK
+
+    if action == "sync":
+        if not base.is_dir():
+            die(f"no base to sync from ({base} does not exist)", EXIT_CONFIG)
+        if not home.is_dir():
+            note("no box home yet: the next 'agentbox' seeds one from the base")
+            return EXIT_OK
+        copy, skipped = home_plan(base, home, HOME_PUSH_DEFAULT)
+        if not copy:
+            note("this box already matches the base")
+            _report_skipped(skipped)
+            return EXIT_OK
+        print(f"{len(copy)} file(s) from the base differ here:")
+        for rel in copy[:40]:
+            print(f"  {rel}")
+        if len(copy) > 40:
+            print(f"  ... and {len(copy) - 40} more")
+        _report_skipped(skipped)
+        if args.dry_run:
+            note("dry run: nothing copied")
+            return EXIT_OK
+        kept = 0
+        for rel in copy:
+            dst = home / rel
+            if dst.is_file() and not args.force:
+                kept += 1
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            sh(["cp", "-a", "--reflink=auto", str(base / rel), str(dst)], quiet=True)
+        note(f"synced {len(copy) - kept} file(s)"
+             + (f", kept {kept} this box had changed (--force overwrites)" if kept else ""))
+        return EXIT_OK
+
+    die(f"unknown home action {action}", EXIT_CONFIG)
+
+
+# --------------------------------------------------------------------- update
+
+def cmd_update(args) -> int:
+    lock = lock_data()
+    base = lock["base"]
+    ref = f"{base['image']}:{base['tag']}"
+    res = sh(["skopeo", "inspect", "--format", "{{.Digest}}", f"docker://{ref}"], quiet=True)
+    if res.returncode != 0:
+        die((res.stderr or "skopeo inspect failed").strip(), EXIT_FAIL)
+    latest = res.stdout.strip()
+    print(f"base   {ref}")
+    print(f"  lock   {base['digest']}")
+    print(f"  remote {latest}")
+    if latest == base["digest"]:
+        note("base is already current")
+    else:
+        note("base digest differs -- update tools.lock then 'agentbox build'")
+    for name, spec in (lock.get("tools") or {}).items():
+        print(f"tool   {name}: pinned {spec.get('version') or spec.get('tag')}"
+              f" ({spec.get('source')})")
+    if latest != base["digest"] and args.yes:
+        base["digest"] = latest
+        LOCK.write_text(json.dumps(lock, indent=2) + "\n")
+        note("tools.lock updated; run 'agentbox build'")
+    return EXIT_OK
+
+
+def cmd_gc(args) -> int:
+    data = podman_json("ps", "-a", "--filter", f"label={LABEL}",
+                       "--format", "json") or []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+    plan = []
+    for c in data:
+        if c.get("State") == "running":
+            continue
+        created = c.get("CreatedAt") or ""
+        ts = parse_podman_time(created)
+        if ts and ts < cutoff:
+            plan.append("/".join(c.get("Names") or []))
+    # A box home lives inside its project, so deleting the project already
+    # deleted the home. Nothing per-project is left behind to reap.
+    orphans = []
+
+    if not plan and not orphans:
+        note("nothing older than 14 days")
+        return EXIT_OK
+    for nm in plan:
+        if args.dry_run:
+            print(f"would remove box     {nm}")
+        else:
+            podman("rm", nm)
+            note(f"removed box {nm}")
+    for d in orphans:
+        if args.dry_run:
+            print(f"would remove data    {d}  (no box references it)")
+        else:
+            shutil.rmtree(d, ignore_errors=True)
+            note(f"removed data {d}")
+    if args.dry_run:
+        note("dry run: nothing changed (agentbox gc --apply)")
+    return EXIT_OK
+
+
+def parse_podman_time(text: str):
+    for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(text.strip(), fmt).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+# -------------------------------------------------------------------- doctor
+
+def cmd_doctor(args) -> int:
+    results = []
+
+    def check(num: int, label: str, ok: bool, detail: str = "", fatal: bool = True):
+        state = "ok" if ok else ("FAIL" if fatal else "warn")
+        results.append((state, num, label, detail))
+
+    lock = lock_data()
+    img = image_id()
+    check(1, "image present and matches tools.lock", bool(img),
+          f"id {img[:19]}" if img else "run 'agentbox build'")
+    if img:
+        rec = DATA / "image.json"
+        if rec.exists():
+            data = json.loads(rec.read_text())
+            check(1, "image label matches lock hash", data.get("lock") == lock_hash(),
+                  f"lock {lock_hash()} vs image {data.get('lock')}")
+
+    # 2/3 the box homes hold keys, so none of them may be tracked by git
+    boxes = podman_json("ps", "-a", "--filter", f"label={LABEL}", "--format", "json") or []
+    tracked = []
+    for c in boxes:
+        p = (c.get("Labels") or {}).get("io.agentbox.path") or ""
+        if p and Path(p).is_dir():
+            bad = tracked_home_files(Path(p))
+            if bad:
+                tracked.append(f"{Path(p).name}: {len(bad)} file(s) under {PROJECT_DIR}/")
+    check(2, "no box home is tracked by git", not tracked, "; ".join(tracked))
+
+    # 3 stale boxes
+    stale = [c for c in boxes
+             if (c.get("Labels") or {}).get("io.agentbox.digest") != (img or "")]
+    check(3, "no stale boxes", not stale,
+          ", ".join("/".join(c.get("Names") or []) for c in stale), fatal=False)
+
+    # 4/10 mount sources. The rule is structural, not path-based: a box may bind
+    # exactly one host directory -- its own project root -- plus our named volumes
+    # and the read-only recipe files. Anything else is a leak.
+    bad_mounts, bad_keys = [], []
+    for c in boxes:
+        if c.get("State") != "running":
+            continue
+        nm = "/".join(c.get("Names") or [])
+        ins = podman_json("container", "inspect", nm)
+        if not ins:
+            continue
+        own = (c.get("Labels") or {}).get("io.agentbox.path") or ""
+        own = str(Path(own).resolve()) if own else ""
+        own_home = str(box_home(Path(own))) if own else ""
+        for m in ins[0].get("Mounts") or []:
+            src = m.get("Source") or ""
+            dest = m.get("Destination") or ""
+            src = str(Path(src).resolve()) if src else src
+            if dest == BOX_PROJECT:
+                if not own or src != own:
+                    bad_mounts.append(f"{nm}: {BOX_PROJECT} <- {src} "
+                                      "(not its own project root)")
+                continue
+            if dest == BOX_HOME:
+                if not own or src != own_home:
+                    bad_mounts.append(f"{nm}: $HOME <- {src} "
+                                      "(not this project's agentbox home)")
+                continue
+            in_home = bool(own_home) and src.startswith(own_home + "/")
+            ours = in_home or src == str(AGENT_MD)
+            if ours:
+                if "/.ssh" in src and not in_home:
+                    bad_keys.append(f"{nm}: {src}")
+                continue
+            bad_mounts.append(f"{nm}: {dest} <- {src}")
+    check(4, "all mount sources are allowed", not bad_mounts,
+          "; ".join(bad_mounts) + (" -- a box bound to another checkout or to files "
+                                   "that moved; recreate it: agentbox rm <box> && agentbox up"
+                                   if bad_mounts else ""))
+    check(10, "no host ssh material reachable from a box", not bad_keys, "", fatal=False)
+
+    # 5 SELinux label on the project dirs
+    proj_dirs = sorted({Path(p) for p in
+                        [(c.get("Labels") or {}).get("io.agentbox.path", "") for c in boxes]
+                        if p})
+    unlabelled = [str(p) for p in proj_dirs
+                  if p.exists() and "container_file_t" not in sh(["ls", "-dZ", str(p)]).stdout]
+    check(5, "project dirs carry the SELinux container label", not unlabelled,
+          ", ".join(unlabelled), fatal=False)
+
+    # 6 leftovers from the old docker setup
+    left = []
+    if sh(["docker", "image", "inspect", "debian-agent-sandbox"]).returncode == 0:
+        left.append("image debian-agent-sandbox")
+    if sh(["docker", "ps", "-a", "--filter", "name=agent-sandbox",
+           "--format", "{{.Names}}"]).stdout.strip():
+        left.append("container agent-sandbox")
+    check(6, "no leftovers from the old setup", not left, ", ".join(left), fatal=False)
+
+    # 7 total size of the box homes (caches excluded: they count separately)
+    total = 0
+    for c in boxes:
+        p = (c.get("Labels") or {}).get("io.agentbox.path") or ""
+        if p:
+            total += home_size(Path(p))[1]
+    check(7, "box homes under 20 GiB", total < 20 * 1024 ** 3,
+          f"{total // 1024 ** 2} MiB across {len(boxes)} box(es)", fatal=False)
+
+    # 8 defaults.toml keeps every hardening key
+    defaults = load_toml(DEFAULTS_FILE)
+    missing = SANDBOX_KEYS - set(defaults.get("sandbox") or {})
+    check(8, "defaults.toml has every hardening key", not missing,
+          ", ".join(sorted(missing)))
+
+    # 9 nothing secret may be published: tracked files only, base home is gitignored
+    problems = []
+    # only files that are actually published matter here: agent_home/ is
+    # gitignored and is allowed to hold whatever the operator wants
+    tracked = [l for l in sh(["git", "-C", str(REPO), "ls-files"]).stdout.splitlines()
+               if l.strip()]
+    for rel in tracked:
+        f = REPO / rel
+        if not f.is_file():
+            continue
+        try:
+            head = f.read_text(errors="ignore")[:65536]
+        except OSError:
+            continue
+        marker = "BEGIN OPENSSH " + "PRIVATE KEY"
+        if marker in head or re.search(r"^[\w/]*id_(rsa|ed25519|ecdsa)$", rel):
+            problems.append(rel)
+    for f in (SKEL.rglob("*") if SKEL.exists() else []):
+        if f.is_file():
+            try:
+                if "BEGIN OPENSSH " + "PRIVATE KEY" in f.read_text(errors="ignore")[:65536]:
+                    problems.append(str(f.relative_to(REPO)))
+            except OSError:
+                pass
+    check(9, "no private keys in tracked files", not problems, ", ".join(problems))
+
+    # 11 keys inside a box home are the operator's business, but they must never
+    # be tracked by git: .agentbox/ is checked in 2, and this catches a stray key
+    # file that was copied into the project proper.
+    stray = []
+    for c in boxes:
+        p = (c.get("Labels") or {}).get("io.agentbox.path") or ""
+        if not p or not Path(p).is_dir():
+            continue
+        res = sh(["git", "-C", p, "ls-files"])
+        for rel in res.stdout.splitlines():
+            if KEY_SHAPED.search(Path(rel).name):
+                stray.append(f"{Path(p).name}: {rel}")
+    check(11, "no key-shaped file is tracked in a project", not stray,
+          ", ".join(stray[:4]), fatal=False)
+
+    # 12 AGENT.md baked at both paths, identical to the repo copy
+    if img:
+        res = podman("run", "--rm", "--entrypoint", "/bin/sh", f"{IMAGE_REPO}:current",
+                     "-c", "cat /opt/agentbox/AGENT.md 2>/dev/null | sha256sum")
+        sums = {line.split()[0] for line in (res.stdout or "").splitlines() if line.strip()}
+        want = hashlib.sha256(AGENT_MD.read_bytes()).hexdigest() if AGENT_MD.exists() else ""
+        check(12, "AGENT.md baked and identical to the repo copy", sums == {want},
+              f"{len(sums)} distinct hash(es)")
+
+    print(f"{'STATE':6} {'#':>2}  CHECK")
+    for state, num, label, detail in sorted(results, key=lambda r: r[1]):
+        line = f"{state:6} {num:>2}  {label}"
+        if detail:
+            line += f"  [{detail}]" if state == "ok" else f"\n            -> {detail}"
+        print(line)
+    failed = [r for r in results if r[0] == "FAIL"]
+    print()
+    if failed:
+        print(f"{len(failed)} check(s) failed")
+        return EXIT_FAIL
+    print("all checks passed")
+    return EXIT_OK
+
+
+# ----------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="agentbox", description="One rootless sandbox per project.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Bare 'agentbox' creates the box for $PWD if needed and drops you into it.")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"agentbox {VERSION} (schema {SCHEMA}, code {short_hash()})")
+    p.add_argument("--network", choices=("none", "online"), help="override network mode")
+    p.add_argument("--lab", action="store_true", help="use the lab box (adds /dev/kvm)")
+    sub = p.add_subparsers(dest="cmd")
+
+    funcs = {
+        "status": cmd_status, "ls": cmd_ls, "stop": cmd_stop, "rm": cmd_rm,
+        "logs": cmd_logs, "build": cmd_build, "update": cmd_update,
+        "doctor": cmd_doctor, "gc": cmd_gc, "home": cmd_home,
+    }
+
+    def box(kind, help_, desc=None, epilog=None):
+        sp = sub.add_parser(kind, help=help_, description=desc or help_,
+                            epilog=epilog,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+        sp.set_defaults(func=funcs[kind])
+        return sp
+
+    lab = dict(action="store_true", help="use the lab box (adds /dev/kvm)")
+
+    sp = box("status", "show a box: state, mode, limits, home",
+             "What the box for this directory is (or would be) and what state it is in. "
+             "With a BOX name or project, describes that box from anywhere. Never changes "
+             "anything.")
+    sp.add_argument("target", nargs="?", metavar="BOX", help="NAME or project (default: here)")
+    sp = box("ls", "list every box on this machine",
+             "Every agentbox container: project, state, kind, network mode and path.")
+    sp = box("stop", "stop a box, keep it for reuse")
+    sp.add_argument("target", nargs="?", metavar="BOX", help="NAME or project (default: here)")
+    sp = box("rm", "remove the box (project and home survive)",
+             "Delete the container. Your project files and the box's $HOME are "
+             "untouched; the next 'agentbox' recreates an identical box.")
+    sp.add_argument("target", nargs="?", metavar="BOX",
+                    help="NAME or project (default: here); works even if that directory is gone")
+    sp.add_argument("--home", action="store_true",
+                    help="also delete this project's .agentbox/home (keys included)")
+    sp = box("logs", "show the box's entrypoint output",
+             "Container stdout: the startup banner plus anything that failed to seed.")
+    sp.add_argument("target", nargs="?", metavar="BOX", help="NAME or project (default: here)")
+    sp.add_argument("-f", "--follow", action="store_true", help="keep streaming")
+    sp.add_argument("--lab", action="store_true", help="the lab box")
+    sp = box("build", "build or rebuild the base image from tools.lock",
+             "Build localhost/agentbox/base from the Containerfile and the pins in "
+             "tools.lock, then record the lock hash so 'doctor' can spot drift.")
+    sp = box("update", "report whether the pinned base and tools are current",
+             "Compare tools.lock against upstream. Changes nothing: edit tools.lock, "
+             "then run 'agentbox build'.")
+    sp.add_argument("-y", "--yes", action="store_true", help="assume yes")
+    sp = box(
+        "home", "your base $HOME: push changes back, sync into a box",
+        f"""A box's $HOME is a copy of your base, taken when the box is created.
+The copy is what this box writes to; the base is what new boxes start from.
+
+base: {BASE_HOME}
+
+ACTION (default: path)
+  path    print the base directory. Changes nothing.
+  open    print it, then open it in your file manager.
+  push    copy what you changed in THIS box back into the base.
+  sync    copy what changed in the base into THIS box.
+  reset   delete this box's $HOME (and its container) to start over.
+
+`push` reaches new boxes only. A box that already exists keeps the copy it was
+given until you run `agentbox home sync` inside it; sync keeps any file the box
+changed itself, unless you pass --force.
+
+PATH (push only)
+  Zero or more files or directories relative to $HOME, e.g.
+  `agentbox home push .config/nvim`. With none, push sends the shell config,
+  .gitconfig, .config, bin and .local/bin.
+
+  Never pushed, whatever you name: .ssh, .cache, .history, .local/state,
+  package-store caches, node_modules, .venv, symlinks, files over 50 MB,
+  key-shaped file names, and file contents that look like a credential.
+
+examples
+  agentbox home                      where the base lives
+  agentbox home push                 promote this box's setup to the base
+  agentbox home push .config/nvim    promote one directory
+  agentbox home push --dry-run       list what would change, copy nothing
+  agentbox home sync --force         take the base, discarding local edits
+  agentbox home reset --yes          fresh $HOME on the next start""")
+    sp.add_argument("action", nargs="?", default="path", metavar="ACTION",
+                    choices=("path", "open", "push", "sync", "reset"),
+                    help="what to do (default: path)")
+    sp.add_argument("paths", nargs="*", metavar="PATH",
+                    help="push: files or directories relative to $HOME "
+                         "(default: shell config, .gitconfig, .config, bin, .local/bin)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="push/sync: list what would change, copy nothing")
+    sp.add_argument("--force", action="store_true",
+                    help="sync: overwrite files this box changed (default: keep them)")
+    sp.add_argument("--yes", action="store_true",
+                    help="reset: required — it deletes the home and any keys in it")
+    sp = box("doctor", "check the whole setup for drift and leaks",
+             "Twelve checks: image and lock, project homes untracked, stale boxes, mount "
+             "sources, SELinux labels, old-setup leftovers, disk, defaults, secrets, tracked "
+             "keys, AGENT.md.")
+    sp = box("gc", "list stopped boxes older than 14 days",
+             "Dry run by default; --apply removes them.")
+    sp.add_argument("--dry-run", action="store_true", default=True, help="default: report only")
+    sp.add_argument("--apply", dest="dry_run", action="store_false", help="remove them")
+
+    args = p.parse_args(argv)
+    if args.network:
+        CLI_OVERRIDE["network"] = args.network
+    if not getattr(args, "func", None):
+        # bare invocation: ensure + shell
+        return cmd_enter(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except SystemExit as exc:
+        return int(exc.code or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

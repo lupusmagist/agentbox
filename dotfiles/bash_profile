@@ -1,0 +1,4 @@
+# Login shells read this file, not ~/.bashrc. Keep the two in step so that
+# `bash -l`, `su -`, or any tool that starts a login shell behaves like the
+# interactive shell `agentbox` gives you.
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"

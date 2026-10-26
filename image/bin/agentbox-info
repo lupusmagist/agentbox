@@ -1,0 +1,34 @@
+#!/bin/sh
+# Ground truth for this box. Printed, not inferred. See DESIGN.md 7.7.
+set -u
+say() { printf '%-11s %s\n' "$1" "$2"; }
+
+PROJ="$HOME/project"
+
+say project   "${AGENTBOX_PROJECT:-?}  (${AGENTBOX_PATH:-?})"
+say network   "${AGENTBOX_NETWORK:-?}"
+say lab       "${AGENTBOX_LAB:-0}"
+say schema    "${AGENTBOX_SCHEMA:-?}"
+say uid       "$(id -u):$(id -g)"
+say home      "$HOME  (yours: edit anything; it stays local to this box)"
+say code      "$PROJ"
+
+if [ -e /dev/kvm ]; then
+    say kvm   "present (accelerated VMs possible)"
+else
+    say kvm   "absent (use -accel tcg, or ask for --lab)"
+fi
+
+say writable  "$HOME $PROJ /tmp /run /var/tmp"
+say readonly  "/ (rootfs) and /opt/agentbox (the image: skel .bashrc, AGENT.md)"
+say cache     "$HOME/.cache (disposable, never pushed to the base)"
+
+say shell     "$(bash --version 2>/dev/null | head -1)"
+say editor    "vim (install whatever you prefer into ~/.local/bin)"
+say agents    "none baked — install your own into ~/.local/bin or ~/.npm-global"
+
+if [ -f "$PROJ/AGENTS.md" ]; then say rules "$PROJ/AGENTS.md present"; else say rules "no $PROJ/AGENTS.md"; fi
+if [ -d /knowledge ]; then say packs "$(ls /knowledge | tr '\n' ' ')"; else say packs "none for this project"; fi
+
+say limits    "$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo ?) pids, $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo ?) bytes"
+say caps      "$(awk '/^CapEff/ {print $2}' /proc/self/status 2>/dev/null)"
