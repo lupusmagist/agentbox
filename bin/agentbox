@@ -1238,7 +1238,8 @@ def cmd_doctor(args) -> int:
     # state an older agentbox kept in $USER_HOME: nothing reads it now
     for p in legacy_paths():
         if p.exists():
-            left.append(f"{p} (older agentbox state; safe to delete)")
+            # not "safe to delete": an older version kept user dotfiles here
+            left.append(f"{p} (nothing reads it; review and remove by hand)")
     check(6, "no leftovers from the old setup", not left, ", ".join(left), fatal=False)
 
     # 7 total size of the box homes (caches excluded: they count separately)

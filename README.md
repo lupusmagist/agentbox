@@ -272,7 +272,8 @@ live container and lost its SELinux label. `agentbox` detects that and recreates
 **I had settings in `~/.config/agentbox/config.toml`.** That file is not read any more: `agentbox`
 exits 2 and tells you to move its `[defaults]` and `[sandbox]` tables into `$APP/local.toml`. Only
 the leftover is reported — nothing under `$USER_HOME` is read at runtime, and `doctor` lists any
-remaining old directory as a warning you can delete.
+remaining old directory as a warning — it is not read, but check what is in it before you delete it
+(older versions kept user dotfiles under `~/.config/agentbox/`).
 
 **A tool I installed in one project isn't in another.** Correct: a box home is a copy. `agentbox
 home push` puts it in the base for new boxes, `agentbox home sync` brings an existing one up to
