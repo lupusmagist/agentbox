@@ -17,8 +17,23 @@ When you exit the container, it is stopped freeing up resources.
 Some notes:  
 This tool is not realy made to run your app in a container. Run the agent in the container and fire up the app on your host.
 Can you make work? Sure. Normal Podman(Docker) containers are used so everything is availible.
+The apps installed in the container are baked in by agentbox build.(Set in tools.lock) This is by design. Change it to fit your needs.
 
-AI slop to follow with the usage and instrutions.  
+Install TLDR:  
+```
+git clone https://github.com/lupusmagist/agentbox.git
+cd agentbox
+./install.sh
+agentbox build
+```
+Run in your project with 'agentbox'  
+
+What is still missing:  
+Home directory profiles.  
+Container profiles.  
+Selective network disable. (Allow connections to local network but not Internet)  
+
+AI slop to follow with the usage and instructions.  
 
 -----------------------------------------------------------------------------------------------------------------------
 A rootless container per project, with its own writable `$HOME`, that you enter by typing
