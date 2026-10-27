@@ -29,7 +29,7 @@
     "traceroute",
     "unzip",
     "vim",
-    "fd",
+    "fd-find",
     "wget",
     "xz-utils"
   ],
