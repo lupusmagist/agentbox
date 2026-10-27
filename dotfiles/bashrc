@@ -22,13 +22,12 @@ if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
     . "${NVM_DIR:-$HOME/.nvm}/nvm.sh"
 fi
 
-# Global npm installs need a writable prefix (~/.npm-global, on PATH). It is
-# passed per command instead of being configured, because a `prefix` in .npmrc or
-# NPM_CONFIG_PREFIX makes `nvm use` refuse to switch node versions.
-if command -v npm >/dev/null 2>&1; then
-    npmg() { npm install -g --prefix "$HOME/.npm-global" "$@"; }
-fi
+# npm's global prefix is configured in ~/.config/npm/npmrc (via
+# NPM_CONFIG_USERCONFIG), so plain `npm i -g <tool>` lands in ~/.npm-global/bin.
+# It is not a `prefix` in ~/.npmrc on purpose: nvm refuses `nvm use` when that
+# file or NPM_CONFIG_PREFIX sets one.
 
-# ~/bin and ~/.local/bin first, so a tool you install in this box wins
-export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+# PATH is NOT set here: the canonical list lives in the image (ENV for
+# non-login shells, /etc/profile.d/agentbox-path.sh for login shells), so that a
+# .bashrc of your own cannot lose /opt/agentbox/bin or reorder it.
 

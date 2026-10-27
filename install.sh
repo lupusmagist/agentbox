@@ -127,7 +127,7 @@ Optional: build your \$BASE_HOME, the home every new box starts from. Do it
 inside a box, so nothing in your own \$USER_HOME is involved:
 
   cd <a project> && agentbox     # create a box and enter it
-  ...install your tools, edit ~/.bashrc, npmg <agent>...
+  ...install your tools, edit ~/.bashrc, npm i -g <agent>...
   exit
   agentbox home push             # promote that to \$BASE_HOME for NEW boxes
 

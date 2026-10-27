@@ -37,7 +37,7 @@ RUN set -eux; \
 # itself plus the directory the project appears in, so nothing has to be
 # created inside a bind-mounted path (those land root-owned).
 RUN mkdir -p /home/agentbox/project /opt/agentbox/pinned/bin /opt/agentbox/bin \
-             /opt/agentbox/skel \
+             /opt/agentbox/skel/.config/npm \
  && chown -R 1000:1000 /home/agentbox
 
 # --- no agent CLI is baked ---------------------------------------------------
@@ -60,15 +60,25 @@ RUN git clone -q https://github.com/nvm-sh/nvm /opt/agentbox/pinned/nvm \
 COPY dotfiles/bashrc /opt/agentbox/skel/.bashrc
 # so that `bash -l` (or anything that starts a login shell) also gets .bashrc
 COPY dotfiles/bash_profile /opt/agentbox/skel/.bash_profile
+# npm's global prefix. Deliberately NOT ~/.npmrc: nvm refuses `nvm use` when
+# ~/.npmrc (or NPM_CONFIG_PREFIX) sets a prefix, so the file is reached through
+# NPM_CONFIG_USERCONFIG instead, and both `npm i -g` and `nvm use` work.
+COPY dotfiles/npmrc /opt/agentbox/skel/.config/npm/npmrc
 COPY AGENT.md /opt/agentbox/AGENT.md
 COPY image/ /opt/agentbox/
+# login shells rewrite PATH from scratch (/etc/profile), so the canonical order
+# is restated for them; without this, `bash -lc` loses /opt/agentbox/bin and
+# disagrees with `sh -c`.
+COPY image/profile.d/agentbox-path.sh /etc/profile.d/agentbox-path.sh
 
-RUN chmod 0755 /opt/agentbox/entrypoint.sh /opt/agentbox/bin/agentbox-info
+RUN chmod 0755 /opt/agentbox/entrypoint.sh /opt/agentbox/bin/agentbox-info \
+ && chmod 0644 /etc/profile.d/agentbox-path.sh
 
 ENV HOME=/home/agentbox USER=agentbox LOGNAME=agentbox SHELL=/bin/bash \
     NVM_DIR=/home/agentbox/.nvm \
+    NPM_CONFIG_USERCONFIG=/home/agentbox/.config/npm/npmrc \
     XDG_CACHE_HOME=/home/agentbox/.cache \
-    PATH=/opt/agentbox/bin:/opt/agentbox/pinned/bin:/home/agentbox/.local/bin:/home/agentbox/bin:/home/agentbox/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/home/agentbox/.npm-global/bin:/home/agentbox/.local/bin:/home/agentbox/bin:/opt/agentbox/bin:/opt/agentbox/pinned/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /home/agentbox/project
 USER 1000:1000

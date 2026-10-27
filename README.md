@@ -45,6 +45,10 @@ So: `$BASE_HOME` seeds `$BOX_HOME` once, `$BOX_HOME` is mounted at `$AGENT_HOME`
 push`/`sync` copy between `$BOX_HOME` and `$BASE_HOME`. Nothing reads `$USER_HOME`, not even a
 config file — machine-level settings live in `$APP/local.toml`.
 
+`$AGENT_HOME` behaves like a normal home: `npm i -g <tool>` installs into `~/.npm-global`, the tool
+is on `PATH` (that directory is first, ahead of `~/.local/bin` and `~/bin`), and `agentbox home push`
+carries it to `$BASE_HOME` so the next box starts with it.
+
 ## Installation
 
 ```bash
@@ -61,9 +65,10 @@ The image it builds is deliberately small: Debian, `git curl ca-certificates pro
 build-essential python3` (with venv and pip) `fzf ripgrep highlight vim less jq unzip xz-utils
 openssh-client iproute2 iputils-ping traceroute net-tools qemu-system-x86 qemu-utils`, plus `bash`,
 one neutral `.bashrc` and `AGENT.md`. Node 22 comes from the pinned base image, and `nvm`
-(pinned by commit) is seeded into each box's home so `nvm install 20` works without root. There is
-deliberately no global npm prefix — configuring one breaks `nvm use` — so a global package is
-installed with `npmg <tool>` (an alias for `npm i -g --prefix ~/.npm-global`). The package
+(pinned by commit) is seeded into each box's home so `nvm install 20` works without root. `npm i -g
+<tool>` works with no flag or helper: the global prefix (`~/.npm-global`) is set in
+`~/.config/npm/npmrc` via `NPM_CONFIG_USERCONFIG`, not in `~/.npmrc`, because nvm refuses `nvm use`
+when that file sets a prefix. The package
 list is the `packages` array in `tools.lock` — edit it there, not in the `Containerfile`. There is **no agent
 CLI**, no editor configuration, no shell framework and no version manager — those are your choices,
 and they belong in your `$BASE_HOME` (below), not in an image everyone shares.
@@ -207,9 +212,15 @@ agentbox home push --dry-run         # list what would change, copy nothing
 ```
 
 Some things never travel, whatever you name: `.ssh`, `.cache`, `.history`, `.local/state`,
-package-store caches, `node_modules`, `.venv`, symlinks, files over 50 MB, key-shaped file names
+`.pi`, `.venv`, `node_modules` outside `.npm-global`, symlinks that leave the home or dangle, files
+over 50 MB, key-shaped file names
 (`id_*`, `*.pem`, `.netrc`), and files whose **contents** look like a credential (`sk-…`, `ghp_…`,
 `AKIA…`, `BEGIN … PRIVATE KEY`). Seeds skip `.cache` and `.ssh` for the same reason.
+
+What a package manager installed does travel: `npm i -g <tool>` puts a shim in `~/.npm-global/bin`
+and the package under `~/.npm-global/lib/node_modules`, and both are pushed — a shim only when it
+points inside the home. `~/.local/bin` and `~/bin` travel the same way, so a tool in either is on
+`PATH` in the next box without any extra step.
 
 ### Keys and private things
 

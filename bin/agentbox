@@ -243,7 +243,11 @@ def tracked_home_files(root: Path) -> list[str]:
 
 # What `home push` moves by default, and what it never moves.
 HOME_PUSH_DEFAULT = (".bashrc", ".bash_profile", ".profile", ".gitconfig",
-                     ".dir_colors", ".config", "bin", ".local/bin")
+                     ".dir_colors", ".config", "bin", ".local/bin", ".npm-global")
+# Where a tool's entry point lives when a package manager installed it. What these
+# point at is what makes `npm i -g <tool>` a normal install here: the shims travel
+# and so do the stores they reference.
+SHIM_DIRS = (".npm-global/bin", ".local/bin", "bin")
 HOME_NEVER = (".cache", ".ssh", ".pi", ".gnupg", ".netrc", ".history",
               ".local/state", ".local/share/uv/cache")
 JUNK_DIRS = {"node_modules", ".venv", "__pycache__", ".mypy_cache",
@@ -258,32 +262,109 @@ SECRET_CONTENT = re.compile(
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
 
 
-def home_rel_allowed(rel: str) -> bool:
-    """False for keys, caches, package stores and editor/tool junk."""
+def home_rel_allowed(rel: str, extra_roots=()) -> bool:
+    """False for keys, caches, package stores and editor/tool junk.
+
+    The npm store is the one place a `node_modules` tree is not junk: it is what
+    `npm i -g` installs, and a shim in ~/.npm-global/bin is useless without it.
+    """
     for never in HOME_NEVER:
         if rel == never or rel.startswith(never + "/"):
             return False
+    if KEY_SHAPED.search(Path(rel).name):
+        return False
+    if rel == ".npm-global" or rel.startswith(".npm-global/"):
+        return True
+    for root in extra_roots:
+        if rel == root or rel.startswith(root + "/"):
+            return True
     if any(part in JUNK_DIRS for part in Path(rel).parts):
         return False
-    return not KEY_SHAPED.search(Path(rel).name)
+    return True
 
 
-def home_plan(src: Path, dst: Path, paths=HOME_PUSH_DEFAULT,
+def classify_symlink(home: Path, path: Path) -> tuple[str, str | None]:
+    """(\"inside\", rel) | (\"dangling\", None) | (\"outside\", None).
+
+    /home/agentbox is the same directory as $BOX_HOME, but only inside a box; on
+    the host side (where push runs) it has to be spelled as $BOX_HOME, so a link
+    written the way it is seen in the box is mapped before the decision.
+    """
+    try:
+        raw = os.readlink(path)
+    except OSError:
+        return ("outside", None)
+    if raw.startswith(BOX_HOME + "/"):
+        target = home / raw[len(BOX_HOME) + 1:]
+    elif os.path.isabs(raw):
+        target = Path(raw)
+    else:
+        target = path.parent / raw
+    if not target.exists():
+        return ("dangling", None)
+    try:
+        return ("inside", target.resolve().relative_to(home.resolve()).as_posix())
+    except ValueError:
+        return ("outside", None)
+
+
+def shim_store_roots(home: Path) -> tuple[str, ...]:
+    """Store roots this home's shims point at: .npm-global, .local/share/<name>."""
+    roots = set()
+    for d in SHIM_DIRS:
+        bindir = home / d
+        if not bindir.is_dir():
+            continue
+        for entry in sorted(bindir.iterdir()):
+            if not entry.is_symlink():
+                continue
+            kind, rel = classify_symlink(home, entry)
+            if kind != "inside" or not rel:
+                continue
+            parts = Path(rel).parts
+            if not parts:
+                continue
+            roots.add("/".join(parts[:3]) if parts[0] == ".local" else parts[0])
+    return tuple(sorted(roots))
+
+
+def home_plan(src: Path, dst: Path, paths=None,
               limit: int = 50 * 1024 * 1024):
-    """Files under src/<p> that differ from dst/<p>, plus what was skipped."""
+    """Files under src/<p> that differ from dst/<p>, plus what was skipped.
+
+    paths=None means the defaults plus every store a shim points at, so `push`
+    and `sync` move the same set and a tool cannot travel one way only.
+    """
     copy: list[str] = []
     skipped: list[tuple[str, str]] = []
+    extra = shim_store_roots(src)
+    if paths is None:
+        paths = HOME_PUSH_DEFAULT + extra
+    seen_paths: set[str] = set()
     for p in paths:
-        base = src / p
-        if not base.exists():
+        if p in seen_paths:
             continue
-        items = [base] if base.is_file() else sorted(x for x in base.rglob("*") if x.is_file())
+        seen_paths.add(p)
+        base = src / p
+        if not base.exists() and not base.is_symlink():
+            continue
+        items = [base] if (base.is_file() or base.is_symlink()) else \
+            sorted(x for x in base.rglob("*") if x.is_file() or x.is_symlink())
         for f in items:
             rel = f.relative_to(src).as_posix()
             if f.is_symlink():
-                skipped.append((rel, "symlink"))
+                kind, _target = classify_symlink(src, f)
+                if kind != "inside":
+                    skipped.append((rel, "dangling symlink" if kind == "dangling"
+                                    else "symlink outside the home"))
+                    continue
+                # the link travels; its store is in `paths` via shim_store_roots
+                link_dst = dst / rel
+                if link_dst.is_symlink() and os.readlink(link_dst) == os.readlink(f):
+                    continue
+                copy.append(rel)
                 continue
-            if not home_rel_allowed(rel):
+            if not home_rel_allowed(rel, extra):
                 skipped.append((rel, "keys/cache/junk"))
                 continue
             try:
@@ -1013,7 +1094,7 @@ def cmd_home(args) -> int:
         if not home.is_dir():
             die(f"no box home at {home} yet — start the box first, configure it, "
                 "then push", EXIT_CONFIG)
-        paths = tuple(args.paths) if args.paths else HOME_PUSH_DEFAULT
+        paths = tuple(args.paths) if args.paths else None
         copy, skipped = home_plan(home, base, paths)
         if not copy:
             note(f"nothing to push: {base} already matches this box")
@@ -1044,7 +1125,7 @@ def cmd_home(args) -> int:
         if not home.is_dir():
             note("no box home yet: the next 'agentbox' seeds one from the base")
             return EXIT_OK
-        copy, skipped = home_plan(base, home, HOME_PUSH_DEFAULT)
+        copy, skipped = home_plan(base, home)
         if not copy:
             note("this box already matches the base")
             _report_skipped(skipped)
@@ -1405,11 +1486,13 @@ changed itself, unless you pass --force.
 PATH (push only)
   Zero or more files or directories relative to $AGENT_HOME, e.g.
   `agentbox home push .config/nvim`. With none, push sends the shell config,
-  .gitconfig, .config, bin and .local/bin.
+  .gitconfig, .config, bin, .local/bin and .npm-global (plus whatever store a
+  shim in those bin directories points at).
 
-  Never pushed, whatever you name: .ssh, .cache, .history, .local/state,
-  package-store caches, node_modules, .venv, symlinks, files over 50 MB,
-  key-shaped file names, and file contents that look like a credential.
+  Never pushed, whatever you name: .ssh, .cache, .history, .pi, .local/state,
+  .venv, node_modules outside ~/.npm-global, symlinks that leave your home or
+  dangle, files over 50 MB, key-shaped file names, and file contents that look
+  like a credential. What `npm i -g` installed does travel, shims included.
 
 examples
   agentbox home                      where $BASE_HOME lives

@@ -201,8 +201,8 @@ check "node 22 comes from the image" \
   "(cd $A && XIN sh -c 'node -v' | grep -q '^v22\\.')"
 check "nvm is seeded and runs" \
   "(cd $A && XIN sh -c 'test -s \$HOME/.nvm/nvm.sh && . \$HOME/.nvm/nvm.sh && nvm --version' | grep -qE '^0\\.')"
-check "no global npm prefix is configured (it would break nvm)" \
-  "(cd $A && XIN sh -c 'test -z \"\$(npm config get prefix 2>/dev/null | grep npm-global)\"')"
+check "nvm's veto conditions are absent (no ~/.npmrc prefix, no NPM_CONFIG_PREFIX)" \
+  "(cd $A && XIN sh -c 'test ! -e ~/.npmrc && test -z \"\${NPM_CONFIG_PREFIX:-}\"')"
 check "a commit works with the environment identity" \
   "(cd $A && XIN sh -c 'echo x > committed.txt && git add committed.txt && \
      git commit -qm probe && git log -1 --format=%ae' | grep -qx agent@agentbox.local)"
@@ -357,13 +357,91 @@ check "a box with no base still gets a shell config" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'grep -q agentbox ~/.bashrc')"
 check "and it starts in bash" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'exit 0' 2>/dev/null)"
-check "the skel .bashrc defines the npmg helper" \
-  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'type -t npmg' 2>/dev/null | grep -qx function)"
+check "the skel seeds npm's userconfig" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'test -s ~/.config/npm/npmrc')"
+check "npm's global prefix is the home's npm-global" \
+  "[ \"\$(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN npm config get prefix)\" = /home/agentbox/.npm-global ]"
+check "NPM_CONFIG_USERCONFIG points at that file" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'case \$NPM_CONFIG_USERCONFIG in /home/agentbox/.config/npm/npmrc) ;; *) exit 1;; esac')"
+check "there is no ~/.npmrc (nvm would refuse)" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'test ! -e ~/.npmrc')"
+check "the npmg helper is gone" \
+  "! (cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'command -v npmg' >/dev/null 2>&1)"
 check "the skel history settings are in effect" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'echo -n \$HISTFILE' 2>/dev/null | grep -q .history/bash_history)"
 check "a login shell picks up the skel .bashrc too" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -lc 'echo -n \$HISTFILE' 2>/dev/null | grep -q .history/bash_history)"
 (cd "$E" && AGENTBOX_HOME_BASE="$WORK/nobase" "$AB" rm >/dev/null 2>&1)
+
+group "npm: a normal global install, no --prefix, no helper"
+(cd "$A" && "$AB" </dev/null >/dev/null 2>&1)   # the selection group removed this box
+mkdir -p "$WORK/tiny/package"
+printf '{"name":"agentbox-probe","version":"1.0.0","bin":{"agentbox-probe":"cli.js"}}\n' \
+  > "$WORK/tiny/package/package.json"
+printf '#!/usr/bin/env node\nconsole.log("probe ok")\n' > "$WORK/tiny/package/cli.js"
+chmod +x "$WORK/tiny/package/cli.js"
+tar -C "$WORK/tiny" -czf "$WORK/tiny.tgz" package   # npm's own tarball layout
+cp "$WORK/tiny.tgz" "$A/tiny.tgz"                    # $A is the project mount: visible in the box
+(cd "$A" && XIN sh -c 'npm i -g ~/project/tiny.tgz' > "$WORK/npm-install.log" 2>&1) || true
+check "a bare 'npm i -g' installs into the home" \
+  "(cd $A && XIN sh -c 'test -x ~/.npm-global/bin/agentbox-probe')"
+check "the installed binary runs, from a non-login shell" \
+  "(cd $A && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+check "the installed binary runs, from a login shell" \
+  "(cd $A && XIN bash -lc 'agentbox-probe' | grep -qx 'probe ok')"
+check "npm reported no EACCES/ENOENT" "! grep -qE 'EACCES|ENOENT' $WORK/npm-install.log"
+
+group "PATH: one list, same in every shell"
+check "non-login and login shells agree on PATH" \
+  "[ \"\$(cd $A && XIN sh -c 'echo \$PATH')\" = \"\$(cd $A && XIN bash -lc 'echo \$PATH')\" ]"
+check "npm's bin comes first, then ~/.local/bin, then ~/bin" \
+  "(cd $A && XIN sh -c 'echo \$PATH' | grep -q '^/home/agentbox/.npm-global/bin:/home/agentbox/.local/bin:/home/agentbox/bin:')"
+check "/opt/agentbox/bin survives a login shell" \
+  "(cd $A && XIN bash -lc 'command -v agentbox-info')"
+check "no directory appears twice" \
+  "! (cd $A && XIN sh -c 'echo \$PATH' | tr ':' '\n' | sort | uniq -d | grep -q .)"
+(cd "$A" && XIN sh -c 'cp ~/.bashrc /tmp/bashrc.bak && echo "export ONLY_THIS=x" > ~/.bashrc')
+check "a login shell keeps the image PATH even with a .bashrc of your own" \
+  "(cd $A && XIN bash -lc 'command -v agentbox-info')"
+check "and the tool installed with npm is still found there" \
+  "(cd $A && XIN bash -lc 'agentbox-probe' | grep -qx 'probe ok')"
+(cd "$A" && XIN sh -c 'cp /tmp/bashrc.bak ~/.bashrc')
+
+group "install travels: npm -> box -> base -> new box"
+check "dry run lists the npm store and the shim" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.npm-global/lib/node_modules/agentbox-probe' && \
+    cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.npm-global/bin/agentbox-probe')"
+(cd "$A" && "$AB" home push >/dev/null 2>&1)
+check "the shim arrived in the base" "[ -L $BASE/.npm-global/bin/agentbox-probe ]"
+check "the shim resolves inside the base" \
+  "[ -x $BASE/.npm-global/lib/node_modules/agentbox-probe/cli.js ]"
+D="$WORK/newbox"; mkdir -p "$D"; printf 'schema = 1\nnetwork = "none"\n' > "$D/.agentbox.toml"
+(cd "$D" && "$AB" </dev/null >/dev/null 2>&1)   # a box that did not exist before the push
+check "a brand-new box runs the inherited tool" \
+  "(cd $D && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+check "it is on PATH without anyone fixing PATH" \
+  "(cd $D && XIN sh -c 'command -v agentbox-probe' | grep -q '\.npm-global/bin/agentbox-probe$')"
+(cd "$D" && "$AB" rm >/dev/null 2>&1)
+check "sync brings a base-only tool back into an existing box" \
+  "(cd $B && XIN sh -c 'rm -rf ~/.npm-global/lib/node_modules/agentbox-probe ~/.npm-global/bin/agentbox-probe' && \
+    cd $B && \"$AB\" home sync >/dev/null 2>&1 && cd $B && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+(cd "$A" && XIN sh -c 'mkdir -p ~/.local/bin && ln -sf /etc/hostname ~/.local/bin/outside')
+check "a symlink leaving the home is refused, with a reason" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q 'symlink outside the home')"
+check "it is not published into the base" \
+  "[ ! -e $BASE/.local/bin/outside ] && [ ! -L $BASE/.local/bin/outside ]"
+(cd "$A" && XIN sh -c 'ln -sf /home/agentbox/no-such-path ~/.local/bin/dangling')
+check "a dangling symlink is refused, with a reason" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q 'dangling symlink')"
+(cd "$A" && XIN sh -c 'ln -sf /home/agentbox/.npm-global/lib/node_modules/agentbox-probe/cli.js ~/.local/bin/abs-probe')
+check "an absolute link into \$AGENT_HOME is accepted" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.local/bin/abs-probe')"
+(cd "$A" && XIN sh -c 'mkdir -p ~/.config/other/node_modules/x && echo n > ~/.config/other/node_modules/x/index.js')
+check "node_modules outside the npm store is still junk" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.config/other/node_modules/x/index.js  \[keys/cache/junk\]')"
+(cd "$A" && XIN sh -c 'printf "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\\n" > ~/.npm-global/lib/node_modules/agentbox-probe/.env')
+check "the secrets refusal still holds inside .npm-global" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -qi 'looks like a secret')"
 
 group "secrets: nothing credential-shaped is ever promoted to the base"
 (cd "$A" && "$AB" </dev/null >/dev/null 2>&1)   # the selection group removed this box
