@@ -10,3 +10,6 @@ __pycache__/
 
 # superpowers scratch (ledger, briefs, review packages)
 .superpowers/
+
+# planning docs (superpowers plans, local only)
+docs/
