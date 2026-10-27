@@ -1486,7 +1486,8 @@ changed itself, unless you pass --force.
 PATH (push only)
   Zero or more files or directories relative to $AGENT_HOME, e.g.
   `agentbox home push .config/nvim`. With none, push sends the shell config,
-  .gitconfig, .config, bin and .local/bin.
+  .gitconfig, .config, bin, .local/bin and .npm-global (plus whatever store a
+  shim in those bin directories points at).
 
   Never pushed, whatever you name: .ssh, .cache, .history, .pi, .local/state,
   .venv, node_modules outside ~/.npm-global, symlinks that leave your home or
