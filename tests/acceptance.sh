@@ -407,6 +407,42 @@ check "and the tool installed with npm is still found there" \
   "(cd $A && XIN bash -lc 'agentbox-probe' | grep -qx 'probe ok')"
 (cd "$A" && XIN sh -c 'cp /tmp/bashrc.bak ~/.bashrc')
 
+group "install travels: npm -> box -> base -> new box"
+check "dry run lists the npm store and the shim" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.npm-global/lib/node_modules/agentbox-probe' && \
+    cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.npm-global/bin/agentbox-probe')"
+(cd "$A" && "$AB" home push >/dev/null 2>&1)
+check "the shim arrived in the base" "[ -L $BASE/.npm-global/bin/agentbox-probe ]"
+check "the shim resolves inside the base" \
+  "[ -x $BASE/.npm-global/lib/node_modules/agentbox-probe/cli.js ]"
+D="$WORK/newbox"; mkdir -p "$D"; printf 'schema = 1\nnetwork = "none"\n' > "$D/.agentbox.toml"
+(cd "$D" && "$AB" </dev/null >/dev/null 2>&1)   # a box that did not exist before the push
+check "a brand-new box runs the inherited tool" \
+  "(cd $D && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+check "it is on PATH without anyone fixing PATH" \
+  "(cd $D && XIN sh -c 'command -v agentbox-probe' | grep -q '\.npm-global/bin/agentbox-probe$')"
+(cd "$D" && "$AB" rm >/dev/null 2>&1)
+check "sync brings a base-only tool back into an existing box" \
+  "(cd $B && XIN sh -c 'rm -rf ~/.npm-global/lib/node_modules/agentbox-probe ~/.npm-global/bin/agentbox-probe' && \
+    cd $B && \"$AB\" home sync >/dev/null 2>&1 && cd $B && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+(cd "$A" && XIN sh -c 'mkdir -p ~/.local/bin && ln -sf /etc/hostname ~/.local/bin/outside')
+check "a symlink leaving the home is refused, with a reason" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q 'symlink outside the home')"
+check "it is not published into the base" \
+  "[ ! -e $BASE/.local/bin/outside ] && [ ! -L $BASE/.local/bin/outside ]"
+(cd "$A" && XIN sh -c 'ln -sf /home/agentbox/no-such-path ~/.local/bin/dangling')
+check "a dangling symlink is refused, with a reason" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q 'dangling symlink')"
+(cd "$A" && XIN sh -c 'ln -sf /home/agentbox/.npm-global/lib/node_modules/agentbox-probe/cli.js ~/.local/bin/abs-probe')
+check "an absolute link into \$AGENT_HOME is accepted" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.local/bin/abs-probe')"
+(cd "$A" && XIN sh -c 'mkdir -p ~/.config/other/node_modules/x && echo n > ~/.config/other/node_modules/x/index.js')
+check "node_modules outside the npm store is still junk" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -q '.config/other/node_modules/x/index.js  \[keys/cache/junk\]')"
+(cd "$A" && XIN sh -c 'printf "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\\n" > ~/.npm-global/lib/node_modules/agentbox-probe/.env')
+check "the secrets refusal still holds inside .npm-global" \
+  "(cd $A && \"$AB\" home push --dry-run 2>&1 | grep -qi 'looks like a secret')"
+
 group "secrets: nothing credential-shaped is ever promoted to the base"
 (cd "$A" && "$AB" </dev/null >/dev/null 2>&1)   # the selection group removed this box
 (cd "$A" && XIN sh -c 'printf "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n" > ~/.config/demo/token.env; \
