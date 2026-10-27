@@ -1,5 +1,26 @@
 # agentbox
 
+Hi, human here. This is a small app me, pi and Deepseek vide coded. It might(probibly does) have some issues but mostly it looks to be working.
+This app tries to find middle ground between everything being fixed in the container, ease of configuration of the enviroment and persitance.  
+
+Only the information that you put into the container is availible to the agent.
+
+You run 'agentbox' in your project directory and your project directory gets linked to a container where you can run your AI agent.
+Only one container is made for all your projects, the container $HOME is swapped out for the .agentbox directory that gets created in your project root on start in the project dir. Add the .agentbox/ and .agentbox to your project .gitignore, you dont need to keep it.
+
+The initial container $HOME is copied from the agent_home directory in the agentbox app directory into the container. That means that any apps/config you need in the container you can add into the agent_home dir. Thats the hard way.  The easy way is to make a blank project, agentbox into it, load everything you normally use and then 'agentbox push' this config to the agent_home.  
+
+Now every project you start will copy your config/apps into the container. (Existing projects=existing config. Look at instructions below on how to updates existing configs.)  
+
+When you exit the container, it is stopped freeing up resources.  
+
+Some notes:  
+This tool is not realy made to run your app in a container. Run the agent in the container and fire up the app on your host.
+Can you make work? Sure. Normal Podman(Docker) containers are used so everything is availible.
+
+AI slop to follow with the usage and instrutions.  
+
+-----------------------------------------------------------------------------------------------------------------------
 A rootless container per project, with its own writable `$HOME`, that you enter by typing
 `agentbox` in the project directory.
 
@@ -34,7 +55,7 @@ These are the only paths this project talks about, and confusing them is the sou
 edge cases.
 
 | Name | Where it is | What it is |
-|---|---|---|
+| --- | --- | --- |
 | `$APP` | the checkout, e.g. `~/projects/agentbox` | the application: `bin/agentbox`, `defaults.toml`, `local.toml`, `tools.lock`, `Containerfile`, `agent_home/`. Everything the tool needs is here and nowhere else |
 | `$USER_HOME` | your shell's `~` | **never read.** The tool and the base take nothing from it; the only write is the `install.sh` PATH link, which `--no-link` skips |
 | `$BASE_HOME` | `$APP/agent_home/` | gitignored payload. Copied into a box's home when it is created; never mounted |
@@ -192,7 +213,7 @@ From then on every **new** box starts with your agent, your editor config and yo
 ### Push, sync, reset
 
 | Command | Does |
-|---|---|
+| --- | --- |
 | `agentbox home` | print where the base is |
 | `agentbox home open` | ...and open it in your file manager |
 | `agentbox home push [PATH…] [--dry-run]` | copy what you changed in this box into the base |
@@ -237,7 +258,7 @@ gitignored here, so nothing else will back it up.
 ## Commands
 
 | Command | Does |
-|---|---|
+| --- | --- |
 | `agentbox` | create this project's box if needed, then enter it (with no terminal: print its name) |
 | `status [box]` | state, image, home, base, network, limits. Read-only |
 | `ls` | every box on the machine |
@@ -256,7 +277,7 @@ failure, `2` config error, `3` image missing.
 ## Where things are stored
 
 | What | Path |
-|---|---|
+| --- | --- |
 | `$APP`: CLI, image recipe, `AGENT.md`, `defaults.toml`, `local.toml` | the checkout, e.g. `~/projects/agentbox/` |
 | Built image | `localhost/agentbox/base:current` (+ a dated tag carrying the lock hash) |
 | `$BASE_HOME` | `<checkout>/agent_home/` (gitignored) |
