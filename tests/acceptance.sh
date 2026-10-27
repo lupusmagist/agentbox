@@ -201,8 +201,8 @@ check "node 22 comes from the image" \
   "(cd $A && XIN sh -c 'node -v' | grep -q '^v22\\.')"
 check "nvm is seeded and runs" \
   "(cd $A && XIN sh -c 'test -s \$HOME/.nvm/nvm.sh && . \$HOME/.nvm/nvm.sh && nvm --version' | grep -qE '^0\\.')"
-check "no global npm prefix is configured (it would break nvm)" \
-  "(cd $A && XIN sh -c 'test -z \"\$(npm config get prefix 2>/dev/null | grep npm-global)\"')"
+check "nvm's veto conditions are absent (no ~/.npmrc prefix, no NPM_CONFIG_PREFIX)" \
+  "(cd $A && XIN sh -c 'test ! -e ~/.npmrc && test -z \"\${NPM_CONFIG_PREFIX:-}\"')"
 check "a commit works with the environment identity" \
   "(cd $A && XIN sh -c 'echo x > committed.txt && git add committed.txt && \
      git commit -qm probe && git log -1 --format=%ae' | grep -qx agent@agentbox.local)"
@@ -357,13 +357,55 @@ check "a box with no base still gets a shell config" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'grep -q agentbox ~/.bashrc')"
 check "and it starts in bash" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'exit 0' 2>/dev/null)"
-check "the skel .bashrc defines the npmg helper" \
-  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'type -t npmg' 2>/dev/null | grep -qx function)"
+check "the skel seeds npm's userconfig" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'test -s ~/.config/npm/npmrc')"
+check "npm's global prefix is the home's npm-global" \
+  "[ \"\$(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN npm config get prefix)\" = /home/agentbox/.npm-global ]"
+check "NPM_CONFIG_USERCONFIG points at that file" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'case \$NPM_CONFIG_USERCONFIG in /home/agentbox/.config/npm/npmrc) ;; *) exit 1;; esac')"
+check "there is no ~/.npmrc (nvm would refuse)" \
+  "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN sh -c 'test ! -e ~/.npmrc')"
+check "the npmg helper is gone" \
+  "! (cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'command -v npmg' >/dev/null 2>&1)"
 check "the skel history settings are in effect" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -ic 'echo -n \$HISTFILE' 2>/dev/null | grep -q .history/bash_history)"
 check "a login shell picks up the skel .bashrc too" \
   "(cd $E && AGENTBOX_HOME_BASE=$WORK/nobase XIN bash -lc 'echo -n \$HISTFILE' 2>/dev/null | grep -q .history/bash_history)"
 (cd "$E" && AGENTBOX_HOME_BASE="$WORK/nobase" "$AB" rm >/dev/null 2>&1)
+
+group "npm: a normal global install, no --prefix, no helper"
+(cd "$A" && "$AB" </dev/null >/dev/null 2>&1)   # the selection group removed this box
+mkdir -p "$WORK/tiny/package"
+printf '{"name":"agentbox-probe","version":"1.0.0","bin":{"agentbox-probe":"cli.js"}}\n' \
+  > "$WORK/tiny/package/package.json"
+printf '#!/usr/bin/env node\nconsole.log("probe ok")\n' > "$WORK/tiny/package/cli.js"
+chmod +x "$WORK/tiny/package/cli.js"
+tar -C "$WORK/tiny" -czf "$WORK/tiny.tgz" package   # npm's own tarball layout
+cp "$WORK/tiny.tgz" "$A/tiny.tgz"                    # $A is the project mount: visible in the box
+(cd "$A" && XIN sh -c 'npm i -g ~/project/tiny.tgz' > "$WORK/npm-install.log" 2>&1) || true
+check "a bare 'npm i -g' installs into the home" \
+  "(cd $A && XIN sh -c 'test -x ~/.npm-global/bin/agentbox-probe')"
+check "the installed binary runs, from a non-login shell" \
+  "(cd $A && XIN sh -c 'agentbox-probe' | grep -qx 'probe ok')"
+check "the installed binary runs, from a login shell" \
+  "(cd $A && XIN bash -lc 'agentbox-probe' | grep -qx 'probe ok')"
+check "npm reported no EACCES/ENOENT" "! grep -qE 'EACCES|ENOENT' $WORK/npm-install.log"
+
+group "PATH: one list, same in every shell"
+check "non-login and login shells agree on PATH" \
+  "[ \"\$(cd $A && XIN sh -c 'echo \$PATH')\" = \"\$(cd $A && XIN bash -lc 'echo \$PATH')\" ]"
+check "npm's bin comes first, then ~/.local/bin, then ~/bin" \
+  "(cd $A && XIN sh -c 'echo \$PATH' | grep -q '^/home/agentbox/.npm-global/bin:/home/agentbox/.local/bin:/home/agentbox/bin:')"
+check "/opt/agentbox/bin survives a login shell" \
+  "(cd $A && XIN bash -lc 'command -v agentbox-info')"
+check "no directory appears twice" \
+  "! (cd $A && XIN sh -c 'echo \$PATH' | tr ':' '\n' | sort | uniq -d | grep -q .)"
+(cd "$A" && XIN sh -c 'cp ~/.bashrc /tmp/bashrc.bak && echo "export ONLY_THIS=x" > ~/.bashrc')
+check "a login shell keeps the image PATH even with a .bashrc of your own" \
+  "(cd $A && XIN bash -lc 'command -v agentbox-info')"
+check "and the tool installed with npm is still found there" \
+  "(cd $A && XIN bash -lc 'agentbox-probe' | grep -qx 'probe ok')"
+(cd "$A" && XIN sh -c 'cp /tmp/bashrc.bak ~/.bashrc')
 
 group "secrets: nothing credential-shaped is ever promoted to the base"
 (cd "$A" && "$AB" </dev/null >/dev/null 2>&1)   # the selection group removed this box

@@ -1,4 +1,11 @@
-# Global npm installs go into your home, because /usr/local is read-only here.
-# This lives in ~/.npmrc rather than NPM_CONFIG_PREFIX because nvm refuses to run
-# with that environment variable set.
+# npm's global prefix lives in the home, because /usr/local is read-only here.
+#
+# This file is installed as ~/.config/npm/npmrc and reached through
+# NPM_CONFIG_USERCONFIG. It is deliberately NOT ~/.npmrc: nvm refuses `nvm use`
+# when ~/.npmrc (or NPM_CONFIG_PREFIX) sets a prefix, and the point is that
+# `npm i -g <tool>` and `nvm use 20` both work with no helper and no flags.
+#
+# The result is the same directory the old `npmg` helper used, so a tool
+# installed here is on PATH (~/.npm-global/bin) and `agentbox home push` carries
+# it to the base for new boxes.
 prefix=${HOME}/.npm-global

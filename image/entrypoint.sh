@@ -14,6 +14,13 @@ for f in .bashrc .bash_profile; do
     [ -e "$HOME/$f" ] || cp -n "/opt/agentbox/skel/$f" "$HOME/$f" 2>/dev/null || true
 done
 
+# npm's global prefix, seeded and never overwritten. Reached through
+# NPM_CONFIG_USERCONFIG (set in the image), not ~/.npmrc, because nvm refuses
+# `nvm use` when ~/.npmrc sets a prefix.
+mkdir -p "$HOME/.config/npm" 2>/dev/null || true
+[ -e "$HOME/.config/npm/npmrc" ] || \
+    cp -n /opt/agentbox/skel/.config/npm/npmrc "$HOME/.config/npm/npmrc" 2>/dev/null || true
+
 # the agent contract lives in the image; link it into the home
 for f in AGENT.md AGENTS.md; do
     [ -e "$HOME/$f" ] || ln -s /opt/agentbox/AGENT.md "$HOME/$f" 2>/dev/null || true
