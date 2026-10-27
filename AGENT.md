@@ -112,7 +112,9 @@ start, so `nvm install <version>` works and persists in this box; it does not to
 A global npm package is just `npm i -g <tool>`: the prefix (`~/.npm-global`) is configured in
 `~/.config/npm/npmrc`, reached through `NPM_CONFIG_USERCONFIG`. It is deliberately not `~/.npmrc`,
 because nvm refuses `nvm use` when that file (or `NPM_CONFIG_PREFIX`) sets a prefix. Both work, and
-neither needs a flag, an alias or a `--prefix`.
+neither needs a flag, an alias or a `--prefix`. One difference from a host with nvm: the prefix is
+shared, so `npm i -g` under `nvm use 20` still installs into `~/.npm-global`, not into the node
+version's own directory — the tool stays on `PATH` whichever node you switch to.
 
 `~/.local/bin` and `~/bin` are on `PATH` and win over the image. Project dependencies belong in the
 project (`node_modules/`, `.venv/`) — do not hoist them into `~/.local`. List what you installed in
