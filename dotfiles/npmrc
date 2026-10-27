@@ -5,7 +5,6 @@
 # when ~/.npmrc (or NPM_CONFIG_PREFIX) sets a prefix, and the point is that
 # `npm i -g <tool>` and `nvm use 20` both work with no helper and no flags.
 #
-# The result is the same directory the old `npmg` helper used, so a tool
-# installed here is on PATH (~/.npm-global/bin) and `agentbox home push` carries
-# it to the base for new boxes.
+# A tool installed here is on PATH (~/.npm-global/bin) and `agentbox home push`
+# carries it to the base for new boxes.
 prefix=${HOME}/.npm-global

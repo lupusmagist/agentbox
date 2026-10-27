@@ -101,7 +101,7 @@ Installing something is fine — put it in your home, never in the project's dep
 belongs there:
 
 ```sh
-npmg <tool>                          # npm i -g --prefix ~/.npm-global; on PATH
+npm i -g <tool>                      # global installs land in ~/.npm-global; on PATH
 nvm install 20 && nvm use 20         # other node versions; lands in ~/.nvm, no root
 python3 -m venv .venv && .venv/bin/pip install <pkg>    # project-local, in ~/project
 curl -fsSL <release-url> -o ~/.local/bin/<tool> && chmod +x ~/.local/bin/<tool>
@@ -109,10 +109,10 @@ curl -fsSL <release-url> -o ~/.local/bin/<tool> && chmod +x ~/.local/bin/<tool>
 
 `node` 22 and `npm` come from the image and are the default. `nvm` is seeded into `~/.nvm` on first
 start, so `nvm install <version>` works and persists in this box; it does not touch the system node.
-For a global npm package use `npmg <tool>`, or `npm i -g --prefix ~/.npm-global <tool>`: the prefix
-is passed per command on purpose. A `prefix` configured in `.npmrc` (or `NPM_CONFIG_PREFIX` in the
-environment) makes `nvm use` refuse to switch versions — so there is no global npm prefix here, and
-`npm i -g` on its own will fail with EACCES.
+A global npm package is just `npm i -g <tool>`: the prefix (`~/.npm-global`) is configured in
+`~/.config/npm/npmrc`, reached through `NPM_CONFIG_USERCONFIG`. It is deliberately not `~/.npmrc`,
+because nvm refuses `nvm use` when that file (or `NPM_CONFIG_PREFIX`) sets a prefix. Both work, and
+neither needs a flag, an alias or a `--prefix`.
 
 `~/.local/bin` and `~/bin` are on `PATH` and win over the image. Project dependencies belong in the
 project (`node_modules/`, `.venv/`) — do not hoist them into `~/.local`. List what you installed in

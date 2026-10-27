@@ -25,7 +25,7 @@ fi
 # npm's global prefix is configured in ~/.config/npm/npmrc (via
 # NPM_CONFIG_USERCONFIG), so plain `npm i -g <tool>` lands in ~/.npm-global/bin.
 # It is not a `prefix` in ~/.npmrc on purpose: nvm refuses `nvm use` when that
-# file or NPM_CONFIG_PREFIX sets one. There is no npmg helper any more.
+# file or NPM_CONFIG_PREFIX sets one.
 
 # PATH is NOT set here: the canonical list lives in the image (ENV for
 # non-login shells, /etc/profile.d/agentbox-path.sh for login shells), so that a
